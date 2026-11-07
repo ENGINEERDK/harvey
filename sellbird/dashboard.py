@@ -393,6 +393,7 @@ async def get_settings():
         "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
         "M365_CLIENT_ID", "M365_TENANT_ID",
         "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
+        "PROSPEO_API_KEY", "APOLLO_API_KEY", "EMAIL_FINDERS",
     ]
     for key in all_keys:
         if key not in env_vars:
@@ -400,6 +401,12 @@ async def get_settings():
 
     def is_set(k):
         return bool((env_vars.get(k) or "").strip())
+
+    def hint(k):
+        """A saved key's last four characters, so the user can tell which key
+        is set without the key itself ever reaching the browser."""
+        value = (env_vars.get(k) or "").strip()
+        return f"••••{value[-4:]}" if len(value) >= 12 else ("••••" if value else "")
 
     # Gmail is authorized once sellbird gmail auth has stored a token file.
     gmail_token = (PROJECT_ROOT / "data" / "gmail_token.json").is_file()
@@ -432,7 +439,39 @@ async def get_settings():
         "reoon_api_key_set": is_set("REOON_API_KEY"),
         "zerobounce_api_key_set": is_set("ZEROBOUNCE_API_KEY"),
         "hunter_api_key_set": is_set("HUNTER_API_KEY"),
+        "reoon_api_key_hint": hint("REOON_API_KEY"),
+        "zerobounce_api_key_hint": hint("ZEROBOUNCE_API_KEY"),
+        "hunter_api_key_hint": hint("HUNTER_API_KEY"),
+        "prospeo_api_key_hint": hint("PROSPEO_API_KEY"),
+        "apollo_api_key_hint": hint("APOLLO_API_KEY"),
+        # Email finders: keys are secret (presence only); the order isn't.
+        "prospeo_api_key_set": is_set("PROSPEO_API_KEY"),
+        "apollo_api_key_set": is_set("APOLLO_API_KEY"),
+        "email_finders": env_vars.get("EMAIL_FINDERS", ""),
     }
+
+
+# What's left on each connected API: read at most every 10 minutes (or on
+# Refresh), so opening Settings doesn't call every service each time.
+_API_USAGE_TTL = 600
+_api_usage_cache: dict = {"at": None, "rows": None}
+
+
+@app.get("/api/settings/usage")
+async def get_api_usage(refresh: bool = False):
+    """Credits and searches left on each connected service, with when they
+    renew and Sellbird's own monthly caps. Free, read-only account calls."""
+    from sellbird.integrations.balances import check_all
+    now = datetime.now(timezone.utc)
+    at = _api_usage_cache["at"]
+    if refresh or at is None or (now - at).total_seconds() > _API_USAGE_TTL:
+        state = _state()
+        await state.init_db()
+        _api_usage_cache["rows"] = await check_all(state, keys=_read_env_file())
+        _api_usage_cache["at"] = at = now
+    from sellbird.integrations.balances import needs_action
+    rows = _api_usage_cache["rows"]
+    return {"checked_at": at.isoformat(), "services": rows, "needs_action": needs_action(rows)}
 
 
 @app.post("/api/settings/env")
@@ -452,7 +491,8 @@ async def save_env_settings(request: Request):
                      "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
                      "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
                      "M365_CLIENT_ID", "M365_TENANT_ID",
-                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY"]:
+                     "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
+                     "PROSPEO_API_KEY", "APOLLO_API_KEY", "EMAIL_FINDERS"]:
             if key in data and data[key] is not None:
                 value = data[key]
                 if isinstance(value, bool) or not isinstance(value, (str, int, float)):
@@ -460,6 +500,15 @@ async def save_env_settings(request: Request):
                                         status_code=400)
                 value = str(value)
                 # A port Sellbird can't parse would stop it starting at all.
+                if key == "EMAIL_FINDERS":
+                    from sellbird.integrations.email_finders import KNOWN
+                    names = [n.strip().lower() for n in value.split(",") if n.strip()]
+                    unknown = [n for n in names if n not in KNOWN]
+                    if unknown:
+                        return JSONResponse({"success": False, "message":
+                                             f"Unknown email finder: {', '.join(unknown)}. "
+                                             f"Use {', '.join(KNOWN)}."}, status_code=400)
+                    value = ",".join(dict.fromkeys(names))
                 if key.endswith("_PORT") and value.strip() and not value.strip().isdigit():
                     return JSONResponse({"success": False, "message": f"{key} must be a number."},
                                         status_code=400)
@@ -1284,6 +1333,76 @@ async def _with_context(items: list[dict]) -> list[dict]:
     return items
 
 
+async def _recent_bounces() -> dict:
+    """Sellbird's own bounces (address, reason, how it was found, what to
+    tighten), how many bounces of other mail were ignored, and both monitors."""
+    rows = await query_db(
+        "SELECT action_type, details_json, created_at FROM actions "
+        "WHERE action_type IN ('bounce', 'bounce_ignored') "
+        "ORDER BY created_at DESC LIMIT 50")
+    bounces, ignored = [], 0
+    for row in rows:
+        try:
+            details = json.loads(row.get("details_json") or "{}")
+        except (TypeError, ValueError):
+            details = {}
+        if not isinstance(details, dict):
+            details = {}
+        # Older versions logged other mail's bounces as 'bounce' with no address.
+        if row["action_type"] == "bounce_ignored" or details.get("prospect", "unknown") == "unknown":
+            ignored += 1
+            continue
+        bounces.append({**details, "at": row.get("created_at")})
+    return {"bounces": bounces[:25], "bounces_ignored": ignored,
+            "bounce_stats": await _bounce_stats()}
+
+
+async def _bounce_stats() -> dict:
+    """Both bounce monitors as the kill switch sees them, and where each
+    limit is set: Sellbird's own bounce rate, and bounces of other mail in the
+    mailbox within the window."""
+    from sellbird.agents.handler import MIN_SENDS_FOR_KILL_SWITCH
+    from sellbird.bounces import MAILBOX_SINCE_KEY, mailbox_window_start, resumed_after_row
+    from sellbird.config import EmailChannelConfig
+    defaults = EmailChannelConfig()
+    config_file = _resolve_config_file().name
+    try:
+        from sellbird.config import load_config
+        email = load_config(str(_resolve_config_file())).channels.email
+        rate, limit, days = email.max_bounce_rate, email.mailbox_bounce_limit, email.mailbox_bounce_days
+    except Exception:
+        rate, limit, days = defaults.max_bounce_rate, defaults.mailbox_bounce_limit, defaults.mailbox_bounce_days
+    state = _state()
+    await state.init_db()
+    bounced = int(await state.get_setting("bounce_count") or 0)
+    sent = await state.count_outbox_sent()
+    return {
+        "config_file": config_file,
+        "sellbird": {"bounced": bounced, "sent": sent, "limit_rate": rate,
+                   "rate": round(bounced / sent, 4) if sent else 0.0,
+                   "min_sends": MIN_SENDS_FOR_KILL_SWITCH,
+                   "setting": "channels.email.max_bounce_rate",
+                   "default": defaults.max_bounce_rate},
+        "mailbox": {"count": await state.count_mailbox_bounces(
+                        mailbox_window_start(days),
+                        resumed_after_row(await state.get_setting(MAILBOX_SINCE_KEY))),
+                    "limit": limit, "days": days,
+                    "setting": "channels.email.mailbox_bounce_limit",
+                    "days_setting": "channels.email.mailbox_bounce_days",
+                    "default": defaults.mailbox_bounce_limit,
+                    "default_days": defaults.mailbox_bounce_days},
+    }
+
+
+@app.get("/api/bounces")
+async def get_bounces():
+    """Bounces and the two monitors that can pause sending, for Controls."""
+    try:
+        return await _recent_bounces()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @app.get("/api/outbox")
 async def get_outbox_api():
     """Outbox queue + kill-switch state for the Outbox tab."""
@@ -1673,8 +1792,7 @@ async def sending_toggle(action: str):
         if action == "pause":
             await state.set_setting("sending_paused", "paused from dashboard")
         else:
-            await state.set_setting("sending_paused", "")
-            await state.set_setting("bounce_count", "0")
+            await state.resume_sending()
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)

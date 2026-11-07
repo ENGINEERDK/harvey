@@ -15,6 +15,10 @@ import unicodedata
 from datetime import datetime, timezone
 
 from sellbird.booking import booking_instruction
+from sellbird.bounces import (
+    KINDS, MAILBOX_SINCE_KEY, bounce_kind, bounce_reason, failed_addresses, how_found,
+    mailbox_pause_reason, mailbox_window_start, resumed_after_row, suggestions,
+)
 from sellbird.brain import Brain, BrainUnavailable
 from sellbird.config import (
     DEFAULT_OPT_OUT_LINE, PREVIOUS_DEFAULT_OPT_OUT_LINE, SellbirdConfig, EnvConfig, compliance_of, legacy_sending_held,
@@ -1226,37 +1230,87 @@ class Handler:
             provider.confirm_read()
         return complete
 
+    async def _check_mailbox_bounces(self):
+        """The mailbox monitor: pause sending when bounces of mail Sellbird
+        didn't send pile up (channels.email.mailbox_bounce_limit within
+        mailbox_bounce_days). Sellbird's own bounces have their own rate."""
+        email = self.config.channels.email
+        limit = getattr(email, "mailbox_bounce_limit", 10)
+        days = getattr(email, "mailbox_bounce_days", 7)
+        if limit <= 0 or await self.state.get_setting(KILL_SWITCH_KEY):
+            return
+        count = await self.state.count_mailbox_bounces(
+            mailbox_window_start(days),
+            resumed_after_row(await self.state.get_setting(MAILBOX_SINCE_KEY)))
+        if count >= limit:
+            reason = mailbox_pause_reason(count, days, limit)
+            await self.state.set_setting(KILL_SWITCH_KEY, reason)
+            logger.error(f"Handler: KILL SWITCH ENGAGED — {reason}")
+
     async def _handle_bounce(self, msg):
-        """A bounce is a data bug AND a reputation threat. Fix both."""
+        """A bounce is a data bug AND a reputation threat. Fix both.
+
+        Only a bounce of mail Sellbird sent counts: matched by In-Reply-To, or
+        by a failed recipient the notice names that Sellbird emailed. The
+        sending mailbox can be the owner's everyday one, and a bounce of their
+        own mail must not pause Sellbird's sending."""
         outbox_item = await self.state.find_outbox_by_message_id(msg.in_reply_to)
+        matched_by = "message_id" if outbox_item else ""
+        if not outbox_item:
+            outbox_item = await self.state.find_sent_outbox_to(
+                failed_addresses(msg.subject, msg.body, msg.headers))
+            matched_by = "address" if outbox_item else ""
         prospect = None
         if outbox_item:
             prospect = await self.state.get_prospect(outbox_item["prospect_id"])
 
-        if prospect:
-            await self.state.update_prospect_email(
-                prospect.id, prospect.email, "invalid"
+        if not prospect:
+            logger.info(
+                f"Handler: bounce received ({msg.subject[:60]}) for mail Sellbird "
+                "didn't send; not counted."
             )
-            await self._suppress(prospect.email, "bounced", "bounce")
-            cancelled = await self.state.cancel_pending_outbox_for_prospect(
-                prospect.id, reason="bounced"
+            await self.state.log_action(
+                action_type="bounce_ignored", agent="handler",
+                details={"subject": msg.subject[:160], "from": msg.from_email},
             )
-            logger.warning(
-                f"Handler: BOUNCE for {prospect.email} — marked invalid, "
-                f"cancelled {cancelled} queued email(s)."
-            )
-        else:
-            logger.warning(
-                f"Handler: bounce received ({msg.subject[:60]}) but couldn't "
-                "match it to a sent email."
-            )
+            await self._check_mailbox_bounces()
+            return
+
+        status_at_send = prospect.email_status
+        await self.state.update_prospect_email(prospect.id, prospect.email, "invalid")
+        await self._suppress(prospect.email, "bounced", "bounce")
+        cancelled = await self.state.cancel_pending_outbox_for_prospect(
+            prospect.id, reason="bounced"
+        )
+        logger.warning(
+            f"Handler: BOUNCE for {prospect.email} — marked invalid, "
+            f"cancelled {cancelled} queued email(s)."
+        )
+
+        reason = bounce_reason(msg.body)
+        kind = bounce_kind(reason)
+        domain = prospect.email.partition("@")[2]
+        try:
+            pattern = await self.state.get_email_pattern(domain) or {}
+        except Exception:
+            pattern = {}
+        tips = suggestions(
+            kind, source=prospect.source or "", email_status=status_at_send,
+            catch_all=bool(pattern.get("is_catch_all")), mx_type=pattern.get("mx_type") or "",
+            send_to_risky=bool(getattr(self.config.channels.email, "send_to_risky", False)),
+        )
 
         bounces = await self.state.increment_setting(BOUNCE_COUNT_KEY)
         total_sent = await self.state.count_outbox_sent()
         await self.state.log_action(
             action_type="bounce",
             agent="handler",
-            details={"prospect": prospect.email if prospect else "unknown",
+            details={"prospect": prospect.email, "prospect_id": prospect.id,
+                     "name": prospect.full_name(), "company": prospect.company,
+                     "step": outbox_item.get("step"), "sent_at": outbox_item.get("sent_at"),
+                     "matched_by": matched_by, "reason": reason, "kind": kind,
+                     "email_status": status_at_send, "found_by": how_found(prospect.source or ""),
+                     "suggestions": tips, "cancelled": cancelled,
                      "bounces": bounces, "total_sent": total_sent},
         )
 
@@ -1268,7 +1322,8 @@ class Handler:
         ):
             reason = (
                 f"bounce rate {bounces}/{total_sent} exceeded "
-                f"{max_rate:.0%} — check list quality before resuming"
+                f"{max_rate:.0%} (latest: {prospect.email}, {KINDS[kind]}) "
+                "— check list quality before resuming"
             )
             await self.state.set_setting(KILL_SWITCH_KEY, reason)
             logger.error(f"Handler: KILL SWITCH ENGAGED — {reason}")

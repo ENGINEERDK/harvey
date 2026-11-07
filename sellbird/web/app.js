@@ -424,9 +424,9 @@ function loadCurrentTab() {
     case 'activity': loadActivity(); break;
     case 'inboxes': loadInboxes(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); loadSendingModeCard(); break;
+    case 'settings': loadSettings(); loadSendingModeCard(); loadApiUsage(); break;
     case 'company': loadCompany(); break;
-    case 'controls': loadSellbirdStatus(); loadLogs(); break;
+    case 'controls': loadSellbirdStatus(); loadLogs(); loadBounces(); break;
   }
 }
 
@@ -1247,6 +1247,47 @@ function pageCohort(dir) {
 
 // ── Settings ──
 
+const API_USAGE_NAMES = {
+  reoon: 'Reoon', zerobounce: 'ZeroBounce', hunter: 'Hunter', prospeo: 'Prospeo',
+  apollo: 'Apollo', serper: 'Serper',
+};
+const API_USAGE_STATUS = {
+  ok: ['OK', 'verified'], low: ['Low', 'risky'], exhausted: ['Used up', 'bad'],
+  unknown: ['Check on site', 'guess'], error: ["Couldn't check", 'bad'],
+};
+
+// What's left on each connected API, so a top-up can be planned before a
+// service runs dry. Free account checks, cached for 10 minutes.
+async function loadApiUsage(refresh) {
+  const el = document.getElementById('api-usage-card');
+  if (!el) return;
+  const data = await api('/api/settings/usage' + (refresh ? '?refresh=true' : ''));
+  if (!data || !data.services) { el.innerHTML = '<div class="empty"><div class="copy">Couldn’t read usage just now.</div></div>'; return; }
+  const rows = data.services.filter(s => s.connected);
+  const off = data.services.filter(s => !s.connected).map(s => API_USAGE_NAMES[s.tool] || s.tool);
+  let html = '<table><thead><tr><th>Service</th><th>Status</th><th>Left</th><th>Renews</th>' +
+    '<th>Sellbird’s monthly cap</th><th></th></tr></thead><tbody>';
+  for (const s of rows) {
+    const [label, tone] = API_USAGE_STATUS[s.status] || ['—', 'muted'];
+    const cap = s.harvey_cap && s.harvey_cap.cap ? s.harvey_cap.used + ' of ' + s.harvey_cap.cap + ' used' : '';
+    const href = safeHref(s.plans_url);
+    html += '<tr><td><div class="cell-stack"><span class="cell-main">' + escHtml(API_USAGE_NAMES[s.tool] || s.tool) +
+        '</span><span class="cell-sub">' + escHtml(s.label) + '</span></div></td>' +
+      '<td><span class="email-tag ' + tone + '">' + label + '</span></td>' +
+      '<td style="white-space:normal">' + escHtml(s.detail) + '</td>' +
+      '<td class="muted">' + escHtml(s.resets) + '</td>' +
+      '<td class="muted">' + escHtml(cap) + '</td>' +
+      '<td>' + (href ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">Plans &#8599;</a>' : '') + '</td></tr>';
+  }
+  html += '</tbody></table>';
+  if (!rows.length) html = '<div class="empty"><div class="copy">No API services connected yet.</div></div>';
+  const notes = (data.needs_action || []).map(n => '<li>' + escHtml(n) + '</li>').join('');
+  if (notes) html = '<div class="usage-notes"><b>Needs action</b><ul>' + notes + '</ul></div>' + html;
+  el.innerHTML = html + '<div class="table-foot">Checked ' + escHtml(formatDate(data.checked_at)) +
+    (off.length ? ' · Not connected: ' + escHtml(off.join(', ')) : '') +
+    ' · <button class="btn btn-ghost btn-sm" onclick="loadApiUsage(true)">Refresh</button></div>';
+}
+
 async function loadSettings() {
   const data = await api('/api/settings');
   if (!data) return;
@@ -1257,11 +1298,11 @@ async function loadSettings() {
   if (provEl) provEl.textContent = prov;
 
   // Secret fields never echo a value — show a "saved" placeholder instead.
-  const savedPh = (id, isSet, base) => {
+  const savedPh = (id, isSet, base, hint) => {
     const el = document.getElementById(id);
     if (!el) return;
     el.value = '';
-    el.placeholder = isSet ? 'Saved — enter new value to change' : base;
+    el.placeholder = isSet ? 'Saved' + (hint ? ' (' + hint + ')' : '') + ' — enter new value to change' : base;
   };
   const tag = (id, ok, okLabel) => {
     const el = document.getElementById(id);
@@ -1288,9 +1329,9 @@ async function loadSettings() {
   savedPh('imap-pass', data.imap_password_set, 'Same as SMTP password');
   document.getElementById('imap-same-pass').checked = !data.imap_password_set;
   savedPh('instantly-key', data.instantly_api_key_set, 'Enter your Instantly API key');
-  savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier');
-  savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls');
-  savedPh('hunter-key', data.hunter_api_key_set, '50 free/mo + email-pattern lookup');
+  savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier', data.reoon_api_key_hint);
+  savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls', data.zerobounce_api_key_hint);
+  savedPh('hunter-key', data.hunter_api_key_set, '50 free/mo + email-pattern lookup', data.hunter_api_key_hint);
   savedPh('linkedin-password', data.linkedin_password_set, 'Enter password');
   savedPh('cf-api-token', data.cloudflare_api_token_set, 'Your Cloudflare API Token');
 
@@ -1314,6 +1355,12 @@ async function loadSettings() {
   tag('reoon-status', data.reoon_api_key_set, 'set');
   tag('zerobounce-status', data.zerobounce_api_key_set, 'set');
   tag('hunter-status', data.hunter_api_key_set, 'set');
+  savedPh('prospeo-key', data.prospeo_api_key_set, 'Free tier — prospeo.io', data.prospeo_api_key_hint);
+  savedPh('apollo-key', data.apollo_api_key_set, 'Free plan, work email — apollo.io', data.apollo_api_key_hint);
+  tag('prospeo-status', data.prospeo_api_key_set, 'set');
+  tag('apollo-status', data.apollo_api_key_set, 'set');
+  const finders = document.getElementById('email-finders');
+  if (finders) finders.value = data.email_finders || '';
 }
 
 function saveGmail() {
@@ -1360,6 +1407,15 @@ function saveVerifiers() {
   if (h) payload.HUNTER_API_KEY = h;
   if (!Object.keys(payload).length) { showToast('Enter at least one key first.', 'error'); return; }
   saveEnv(payload, 'Verification keys saved.').then(loadSettings);
+}
+
+function saveFinders() {
+  const payload = {EMAIL_FINDERS: document.getElementById('email-finders').value.trim()};
+  const p = document.getElementById('prospeo-key').value;
+  const a = document.getElementById('apollo-key').value;
+  if (p) payload.PROSPEO_API_KEY = p;
+  if (a) payload.APOLLO_API_KEY = a;
+  saveEnv(payload, 'Email finders saved. Restart Sellbird to use them.').then(loadSettings);
 }
 
 async function saveEnv(payload, okMsg) {
@@ -1689,14 +1745,18 @@ async function loadOutbox() {
         : 'Every draft Sellbird writes lands here first. Approve one and it sends on schedule.') +
     '</div>';
 
-  const table = (title, rows, cols) => {
+  // A row with ``detail`` opens it underneath on click (the email itself,
+  // or a bounce's reason and suggestions).
+  const table = (title, rows, cols, detail) => {
     if (!rows || !rows.length) return '';
     let h = '<div class="subhead">' + title + ' <span class="hint">' + rows.length + '</span></div>' +
       '<div class="table-card"><table class="nowrap clip"><thead><tr>' +
       cols.map(c => '<th>' + c[0] + '</th>').join('') + '</tr></thead><tbody>';
     for (const r of rows) {
-      h += '<tr>' + cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
+      h += '<tr' + (detail ? ' class="clickable" title="Click to open" onclick="toggleRowDetail(this)"' : '') + '>' +
+        cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
         (c[3] ? c[1](r) : escHtml(String(c[1](r) ?? ''))) + '</td>').join('') + '</tr>';
+      if (detail) h += '<tr class="detail-row" hidden><td colspan="' + cols.length + '">' + detail(r) + '</td></tr>';
     }
     return h + '</tbody></table></div>';
   };
@@ -1705,15 +1765,106 @@ async function loadOutbox() {
     table('Approved &amp; scheduled', data.approved, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
       ['Sends', r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
-    ]) +
+    ], r => mailPreview(r, 'Sends ' + formatDate(r.send_at))) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
       ['Sent', r => formatDate(r.sent_at), true],
-    ]) +
+    ], r => mailPreview(r, 'Sent ' + formatDate(r.sent_at))) +
     table('Didn\'t send', data.failed, [
       ['To', r => r.to_email], ['Status', r => badge(r.status), false, true],
       ['Reason', r => r.error, true], ['Updated', r => formatDate(r.updated_at), true],
-    ]);
+    ], r => mailPreview(r, r.error ? 'Why: ' + r.error : ''));
+}
+
+// The two bounce monitors that can pause sending, side by side, each with
+// where its limit is set.
+function bounceMonitors(s) {
+  if (!s) return '';
+  const h = s.sellbird, m = s.mailbox, file = escHtml(s.config_file || 'sellbird.yaml');
+  const pct = x => (Math.round(x * 1000) / 10) + '%';
+  const harveyOver = h.limit_rate > 0 && h.sent >= h.min_sends && h.rate > h.limit_rate;
+  const mailboxOver = m.limit > 0 && m.count >= m.limit;
+  const card = (title, value, note, source, over) =>
+    '<div class="monitor' + (over ? ' over' : '') + '"><div class="muted">' + title + '</div>' +
+    '<div class="monitor-value">' + value + '</div><div class="muted">' + note + '</div>' +
+    '<div class="monitor-source">' + source + '</div></div>';
+  return '<div class="bounce-monitors">' +
+    card("Sellbird's emails", h.bounced + ' of ' + h.sent + ' bounced (' + pct(h.rate) + ')',
+         h.limit_rate > 0 ? 'Pauses sending above ' + pct(h.limit_rate) + ', once ' + h.min_sends + ' have been sent'
+                          : 'Monitor off',
+         'Set by <code>' + escHtml(h.setting) + '</code> in ' + file + ' (default ' + pct(h.default) + '; 0 turns it off)',
+         harveyOver) +
+    card('Other mail in this mailbox', m.count + ' bounce' + (m.count === 1 ? '' : 's') + ' in the last ' + m.days + ' days',
+         m.limit > 0 ? 'Pauses sending at ' + m.limit + ': another tool may be sending from this mailbox, or your own mail is bouncing'
+                     : 'Monitor off',
+         'Set by <code>' + escHtml(m.setting) + '</code> (default ' + m.default + '; 0 turns it off) and <code>' +
+           escHtml(m.days_setting) + '</code> (default ' + m.default_days + ' days) in ' + file +
+           '. Resuming sending starts the count again.',
+         mailboxOver) +
+    '</div>';
+}
+
+// Controls → Bounces: the monitors, then Sellbird's own bounces (open one for
+// the server's reason and what to tighten).
+async function loadBounces() {
+  const el = document.getElementById('bounce-panel');
+  if (!el) return;
+  const d = await api('/api/bounces');
+  if (!d || d.error) { el.innerHTML = '<div class="card"><p class="muted">Couldn’t read bounces' + (d && d.error ? ': ' + escHtml(d.error) : '') + '.</p></div>'; return; }
+  const rows = d.bounces || [];
+  let html = bounceMonitors(d.bounce_stats);
+  if (rows.length) {
+    html += '<div class="table-card"><table class="nowrap clip"><thead><tr><th>Address</th><th>Company</th>' +
+      '<th>Why</th><th>Found by</th><th>Bounced</th></tr></thead><tbody>';
+    for (const r of rows) {
+      html += '<tr class="clickable" title="Click to open" onclick="toggleRowDetail(this)"><td>' + escHtml(r.prospect) +
+        '</td><td>' + escHtml(r.company || '') + '</td><td class="muted">' + escHtml(BOUNCE_KINDS[r.kind] || 'Returned') +
+        '</td><td class="muted">' + escHtml(r.found_by || '') + '</td><td class="muted">' + escHtml(formatDate(r.at)) + '</td></tr>' +
+        '<tr class="detail-row" hidden><td colspan="5">' + bounceDetail(r) + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  } else {
+    html += '<p class="muted">None of Sellbird’s emails has bounced.</p>';
+  }
+  if (d.bounces_ignored) {
+    html += '<p class="muted" style="margin-top:var(--sp-2)">' + d.bounces_ignored + ' bounce' +
+      (d.bounces_ignored === 1 ? '' : 's') + ' of other mail in this mailbox (not sent by Sellbird): ' +
+      'not counted toward Sellbird’s rate, but counted by the mailbox monitor.</p>';
+  }
+  el.innerHTML = html;
+}
+
+const BOUNCE_KINDS = {
+  no_mailbox: "Mailbox doesn't exist", mailbox_full: 'Mailbox full',
+  blocked: 'Refused by their server', other: 'Returned',
+};
+
+function toggleRowDetail(tr) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('detail-row')) next.hidden = !next.hidden;
+}
+
+// The email as it was written: subject, recipient, when, and the body.
+function mailPreview(r, when) {
+  return '<div class="mail-preview">' +
+    '<div class="mail-meta"><b>' + escHtml(r.subject || '(no subject)') + '</b>' +
+    '<span class="muted">To ' + escHtml(r.to_email || '') + (r.step ? ' · step ' + escHtml(String(r.step)) : '') +
+    (when ? ' · ' + escHtml(when) : '') + '</span></div>' +
+    '<div class="mail-body">' + escHtml(r.body || '') + '</div></div>';
+}
+
+function bounceDetail(b) {
+  const tips = (b.suggestions || []).map(t => '<li>' + escHtml(t) + '</li>').join('');
+  const row = (k, v) => v ? '<div class="k">' + k + '</div><div class="v">' + escHtml(String(v)) + '</div>' : '';
+  return '<div class="mail-preview"><div class="bounce-facts">' +
+    row('Contact', [b.name, b.company].filter(Boolean).join(' · ')) +
+    row('Server said', b.reason || 'No reason given') +
+    row('Address was', b.email_status ? b.email_status + ' when sent' : '') +
+    row('Found by', b.found_by) +
+    row('Sent', b.sent_at ? formatDate(b.sent_at) + (b.step ? ' (step ' + b.step + ')' : '') : '') +
+    row('Follow-ups cancelled', b.cancelled) +
+    '</div>' + (tips ? '<p style="margin:var(--sp-3) 0 4px"><b>What to tighten</b></p><ul class="bounce-tips">' + tips + '</ul>' : '') +
+    '</div>';
 }
 
 const CONTACT_SOURCES = {

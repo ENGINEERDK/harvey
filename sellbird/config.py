@@ -293,6 +293,12 @@ class EmailChannelConfig(BaseModel):
     # 3) are not prepared, so none can go out to someone who never answered;
     # a reply is still read and answered as usual. Gmail/Microsoft/SMTP only.
     follow_ups: bool = True
+    # Mailbox bounce monitor: bounces of mail Sellbird didn't send (the owner's
+    # own, or another tool sending from this mailbox) also say the mailbox's
+    # reputation is at risk. Pause when this many arrive within
+    # mailbox_bounce_days. 0 disables the monitor.
+    mailbox_bounce_limit: int = 10
+    mailbox_bounce_days: int = 7
     # New domain? Ramp cold email up slowly (see WarmupConfig). Native
     # providers only: Instantly has its own warmup and per-account limits.
     warmup: WarmupConfig = WarmupConfig()
@@ -312,6 +318,20 @@ class EmailChannelConfig(BaseModel):
     @classmethod
     def _blank_signature(cls, v):
         return SignatureConfig() if v is None else v
+
+    @field_validator("mailbox_bounce_limit")
+    @classmethod
+    def _mailbox_limit_non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("mailbox_bounce_limit must be >= 0 (0 turns the monitor off)")
+        return v
+
+    @field_validator("mailbox_bounce_days")
+    @classmethod
+    def _mailbox_days_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("mailbox_bounce_days must be at least 1")
+        return v
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -859,6 +879,10 @@ class EnvConfig(BaseModel):
     tinyfish_api_key: str = ""
     reoon_api_key: str = ""
     zerobounce_api_key: str = ""
+    # Email finders (opt-in by email_finders): see sellbird/integrations/email_finders.py
+    prospeo_api_key: str = ""
+    apollo_api_key: str = ""
+    email_finders: str = ""
     # Native mail providers (channels.email.provider: gmail | smtp)
     gmail_client_id: str = ""
     gmail_client_secret: str = ""
@@ -1005,6 +1029,9 @@ def load_env() -> EnvConfig:
         tinyfish_api_key=os.getenv("TINYFISH_API_KEY", "").strip(),
         reoon_api_key=os.getenv("REOON_API_KEY", "").strip(),
         zerobounce_api_key=os.getenv("ZEROBOUNCE_API_KEY", "").strip(),
+        prospeo_api_key=os.getenv("PROSPEO_API_KEY", "").strip(),
+        apollo_api_key=os.getenv("APOLLO_API_KEY", "").strip(),
+        email_finders=os.getenv("EMAIL_FINDERS", "").strip(),
         gmail_client_id=os.getenv("GMAIL_CLIENT_ID", "").strip(),
         gmail_client_secret=os.getenv("GMAIL_CLIENT_SECRET", "").strip(),
         smtp_host=os.getenv("SMTP_HOST", "").strip(),

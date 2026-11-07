@@ -560,6 +560,13 @@ MIGRATIONS: list[str] = [
     """,
 ]
 
+# When email finders last searched a company for its people: a company whose
+# site named nobody reachable is searched by domain at most once in a while,
+# so finder credits aren't spent on it every cycle.
+LOCAL_COLUMNS: list[tuple[str, str, str]] = [
+    ("companies", "contacts_searched_at", "TIMESTAMP DEFAULT NULL"),
+]
+
 BRAIN_PROVIDERS = ("claude", "codex")
 _USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
 
@@ -628,6 +635,15 @@ class StateManager:
                 if version < target:
                     await db.executescript(script)
                     await db.execute(f"PRAGMA user_version = {target}")
+                    await db.commit()
+
+            # Columns this fork adds outside the numbered list, so they never
+            # collide with a migration upstream adds later.
+            for table, column, decl in LOCAL_COLUMNS:
+                async with db.execute(f"PRAGMA table_info({table})") as cursor:
+                    have = {r[1] for r in await cursor.fetchall()}
+                if column not in have:
+                    await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
                     await db.commit()
 
     # ── Companies ──
@@ -1628,6 +1644,60 @@ class StateManager:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
 
+    async def resume_sending(self) -> None:
+        """Lift the kill switch, and start both bounce monitors afresh: the
+        count of Sellbird's bounces goes back to 0, and the mailbox monitor
+        counts only bounces from now on."""
+        await self.set_setting("sending_paused", "")
+        await self.set_setting("bounce_count", "0")
+        # The log's position, not a clock time: created_at is to the second,
+        # and a bounce logged in the same second as the resume must not count.
+        async with self._connect() as db:
+            async with db.execute("SELECT COALESCE(MAX(rowid), 0) FROM actions") as cursor:
+                last = (await cursor.fetchone())[0]
+        await self.set_setting("mailbox_bounces_since", str(last))
+
+    async def count_mailbox_bounces(self, since: str, after_row: int = 0) -> int:
+        """Bounces of mail Sellbird didn't send, at or after ``since`` and after
+        log position ``after_row``. Includes bounces older versions logged as
+        'bounce' with no address matched (prospect "unknown")."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM actions WHERE created_at >= ? AND rowid > ? AND ("
+                "action_type = 'bounce_ignored' OR (action_type = 'bounce' AND "
+                "COALESCE(json_extract(details_json, '$.prospect'), 'unknown') = 'unknown'))",
+                (since, int(after_row or 0)),
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
+    async def count_actions_since(self, action_type: str, since: str, after_row: int = 0) -> int:
+        """Logged actions of one type at or after ``since`` (UTC,
+        'YYYY-MM-DD HH:MM:SS', as actions.created_at stores it) and logged
+        after the log position ``after_row``."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM actions WHERE action_type = ? AND created_at >= ? "
+                "AND rowid > ?",
+                (action_type, since, int(after_row or 0)),
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
+    async def find_sent_outbox_to(self, addresses) -> dict | None:
+        """The latest sent email to any of ``addresses``: how a bounce whose
+        In-Reply-To doesn't match is tied back to the email it returned."""
+        addresses = [a.strip().lower() for a in addresses or [] if a and "@" in a]
+        if not addresses:
+            return None
+        marks = ",".join("?" * len(addresses))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                f"SELECT * FROM outbox WHERE status = 'sent' AND lower(to_email) IN ({marks}) "
+                "ORDER BY sent_at DESC LIMIT 1", tuple(addresses)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
     async def find_outbox_by_message_id(self, message_id: str) -> dict | None:
         if not message_id:
             return None
@@ -2118,6 +2188,56 @@ class StateManager:
                 (f"-{int(stale_days)} days", int(limit)),
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
+
+    async def companies_without_reachable_contact(
+        self, limit: int = 3, stale_days: int = 90
+    ) -> list[dict]:
+        """Companies whose own site has been read for people, but where no
+        live contact has a sendable (verified or catch-all) address, and that
+        email finders haven't searched in ``stale_days``. Oldest search first.
+
+        A company where anyone has been emailed, replied or opted out is left
+        alone: Sellbird doesn't go looking for their colleagues."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT c.id, c.name, c.domain, c.industry
+                   FROM companies c
+                   WHERE c.domain != ''
+                     AND c.prospects_checked_at IS NOT NULL
+                     AND (c.contacts_searched_at IS NULL
+                          OR c.contacts_searched_at < datetime('now', ?))
+                     AND NOT EXISTS (
+                         SELECT 1 FROM prospects p
+                         WHERE p.company_id = c.id
+                           AND ((p.email_status IN ('verified', 'risky') AND p.status != 'lost')
+                                OR p.status NOT IN ('new', 'queued', 'lost')))
+                   ORDER BY c.contacts_searched_at IS NOT NULL, c.contacts_searched_at,
+                            c.prospects_checked_at
+                   LIMIT ?""",
+                (f"-{int(stale_days)} days", int(limit)),
+            ) as cursor:
+                return [dict(r) for r in await cursor.fetchall()]
+
+    async def prospect_names_at_company(self, company_id: str) -> set[str]:
+        """Lower-cased "first last" of everyone already on file at a company."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT first_name, last_name FROM prospects WHERE company_id = ?",
+                (company_id,),
+            ) as cursor:
+                return {f"{f or ''} {l or ''}".strip().lower()
+                        for f, l in await cursor.fetchall() if (f or l)}
+
+    async def mark_contacts_searched(self, company_id: str):
+        """Record that email finders searched this company for its people."""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE companies SET contacts_searched_at = CURRENT_TIMESTAMP, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (company_id,),
+            )
+            await db.commit()
 
     async def mark_prospects_checked(self, company_id: str):
         """Record that a prospect-backfill pass looked at this company,
