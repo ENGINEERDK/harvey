@@ -222,3 +222,17 @@ async def test_switched_off_it_writes_email_one_without_the_brief(state):
     w = make_writer(brain, state)
     assert len(await w.write_personal_drafts(await state.get_prospect(pid), [0, 3, 4])) == 1
     assert "PCB assemblies" not in brain.prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_follow_ups_after_a_sent_email_follow_on_from_it(state):
+    pid = await setup_prospect(state)
+    brain = Brain({"emails": [{"subject": "s2", "body": "Dear Ana, two"},
+                              {"subject": "s3", "body": "Dear Ana, three"}]})
+    w = make_writer(brain, state, company_brief=True, personal_sequence=True)
+    out = await w._write_personal_sequence(
+        await state.get_prospect(pid), [0, 3, 4],
+        already_sent=[{"subject": "s1", "body": "Dear Ana, the first one"}])
+    assert [e["subject"] for e in out] == ["s2", "s3"]
+    assert "the first one" in brain.prompts[0]
+    assert "Write only the remaining 2 email(s)" in brain.prompts[0]

@@ -707,7 +707,8 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             return None
         return {"subject": subject[:120], "body": body[:2000]}
 
-    async def _write_personal_sequence(self, prospect, delays: list[int]) -> list[dict] | None:
+    async def _write_personal_sequence(self, prospect, delays: list[int],
+                                       already_sent: list[dict] | None = None) -> list[dict] | None:
         """All three emails for one person in one call, grounded in their
         facts, their company's brief and the operator's matching knowledge.
         None when the model's answer isn't three usable emails."""
@@ -744,6 +745,13 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             strict = "- Follow every STRICT EMAIL RULE above."
         gaps = ", ".join(f"email {i + 2} {d} days after the one before" for i, d in enumerate(delays[1:]))
 
+        sent = list(already_sent or [])[:len(delays) - 1]
+        want = len(delays) - len(sent)
+        if sent:
+            shown = "\n\n".join(f"EMAIL {i}\nSubject: {e['subject']}\n{e['body']}"
+                                for i, e in enumerate(sent, start=1))
+            prompt += ("\n\nALREADY SENT to this person (written by us, shown so the next\n"
+                       "emails follow on from it; don't repeat its points):\n\n" + shown)
         prompt += f"""
 
 Write the whole sequence of THREE cold emails to this specific person
@@ -768,16 +776,24 @@ Requirements:
 {strict}{inbox_rule}
 
 Return ONLY JSON: {{"emails": [{{"subject": "...", "body": "..."}}, {{"subject": "...", "body": "..."}}, {{"subject": "...", "body": "..."}}]}}"""
+        if sent:
+            prompt = prompt.replace(
+                "Write the whole sequence of THREE cold emails to this specific person",
+                f"Email{'s' if len(sent) > 1 else ''} 1{'-' + str(len(sent)) if len(sent) > 1 else ''} "
+                f"of this sequence {'were' if len(sent) > 1 else 'was'} already sent (above). "
+                f"Write only the remaining {want} email(s), in order, for this specific person")
+            prompt = prompt.replace("- The three emails must not repeat each other's points or sentences.",
+                                    "- Don't repeat the points or sentences of the emails already sent.")
 
         result = await self.brain.think_json(
             prompt, session_id="sellbird-writer",
             agent="writer", task="personal_sequence",
         )
         emails = result.get("emails") if isinstance(result, dict) else None
-        if not isinstance(emails, list) or len(emails) < len(delays):
+        if not isinstance(emails, list) or len(emails) < want:
             return None
         out = []
-        for e in emails[:len(delays)]:
+        for e in emails[:want]:
             if not isinstance(e, dict):
                 return None
             subject = str(e.get("subject") or "").strip()
