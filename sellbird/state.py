@@ -565,6 +565,10 @@ MIGRATIONS: list[str] = [
 # so finder credits aren't spent on it every cycle.
 LOCAL_COLUMNS: list[tuple[str, str, str]] = [
     ("companies", "contacts_searched_at", "TIMESTAMP DEFAULT NULL"),
+    # A short brief from the company's own site (sellbird.company_brief), and
+    # when it was written (or last failed).
+    ("companies", "brief_json", "TEXT DEFAULT ''"),
+    ("companies", "brief_at", "TIMESTAMP DEFAULT NULL"),
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -765,6 +769,26 @@ class StateManager:
                 row = await cursor.fetchone()
                 return self._company_from_row(row) if row else None
 
+    async def get_company_brief(self, company_id: str) -> tuple[dict, str | None]:
+        """(brief, when it was written) for a company; ({}, None) when none."""
+        from sellbird.company_brief import parse_brief
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT brief_json, brief_at FROM companies WHERE id = ?", (company_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return {}, None
+        return parse_brief(row[0]), row[1]
+
+    async def set_company_brief(self, company_id: str, brief: dict) -> None:
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE companies SET brief_json = ?, brief_at = ? WHERE id = ?",
+                (json.dumps(brief, ensure_ascii=False),
+                 datetime.now(timezone.utc).replace(tzinfo=None).isoformat(), company_id))
+            await db.commit()
+
     async def get_company_by_domain(self, domain: str) -> Company | None:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -905,6 +929,16 @@ class StateManager:
                 "UPDATE prospects SET status = ?, updated_at = ? "
                 "WHERE id = ? AND status IS NOT 'opted_out'",
                 (status, _utcnow().isoformat(), prospect_id),
+            )
+            await db.commit()
+
+    async def update_prospect_company(self, prospect_id: str, company: str):
+        """Correct the company name on a prospect (the writer uses the one the
+        company's own site gives when ours came from a search headline)."""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE prospects SET company = ?, updated_at = ? WHERE id = ?",
+                (company, _utcnow().isoformat(), prospect_id),
             )
             await db.commit()
 

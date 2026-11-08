@@ -795,6 +795,12 @@ class WriterConfig(BaseModel):
     # written for, instead of getting a draft that says it has no advice. Put
     # them back with `sellbird retry-writes --no-tip`, once more is known.
     require_tip: bool = False
+    # Read each company's own site once and summarise what it makes, how and
+    # where (sellbird.company_brief): about one extra model call per company.
+    company_brief: bool = False
+    # Write all three emails per person in one call (native providers), so
+    # follow-ups are about them too, not one template per campaign.
+    personal_sequence: bool = False
 
     @field_validator("email_rules", mode="before")
     @classmethod

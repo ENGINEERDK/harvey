@@ -15,6 +15,7 @@ import re
 from datetime import datetime, timezone
 
 from sellbird.brain import Brain
+from sellbird.company_brief import brief_facts, clean_company_name, ensure_brief
 from sellbird.config import EmailRulesError, SellbirdConfig, compliance_of, load_email_rules
 from sellbird.email_style import (
     BREAKUP_MAX_WORDS, FIRST_EMAIL_MAX_WORDS, FOLLOW_UP_MAX_WORDS,
@@ -22,6 +23,7 @@ from sellbird.email_style import (
 )
 from sellbird.humanize import humanize, humanizer_enabled
 from sellbird.integrations.mail_provider import NATIVE_PROVIDERS
+from sellbird.knowledge import CASE_STUDIES, PLAYBOOK, knowledge_block
 from sellbird.models.campaign import Campaign, EmailStep
 from sellbird.state import WRITABLE_EMAIL_STATUSES, StateManager
 from sellbird.sending_mode import sync_sending_mode
@@ -321,7 +323,7 @@ class Writer:
             # Native providers: replace the shared template for email 1 with
             # a per-prospect draft grounded in that company's actual facts.
             if self.is_native:
-                await self._personalize_first_emails(campaign_id, prospects)
+                await self._personalize_first_emails(campaign_id, prospects, sequence)
 
             await self.state.log_action(
                 action_type="write_campaign",
@@ -406,7 +408,8 @@ class Writer:
                 f"{MAX_WRITE_ATTEMPTS} unusable drafts; marked write_failed."
             )
 
-    async def _personalize_first_emails(self, campaign_id: str, prospects: list):
+    async def _personalize_first_emails(self, campaign_id: str, prospects: list,
+                                        sequence: list | None = None):
         """Draft a grounded, per-prospect email 1 and stage it in the outbox.
 
         The outbox unique index means the sender's later template staging
@@ -422,40 +425,52 @@ class Writer:
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         provider = self.config.channels.email.provider
 
+        delays = await self._step_delays(campaign_id, sequence)
+
+        # (prospect, step, draft): the whole sequence per person when it can
+        # be written, else email 1 alone (steps 2-3 then use the template).
         pending = []
         for prospect in prospects:
             try:
-                draft = await self._write_personal_email(prospect)
+                drafts = await self.write_personal_drafts(prospect, delays)
             except Exception as e:
                 logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
                 continue
-            if draft:
-                pending.append((prospect, draft))
+            for step, draft in enumerate(drafts, start=1):
+                pending.append((prospect, step, draft))
 
         # One Humanizer pass over the whole batch before anything is staged.
         polished = await humanize(
-            self.brain, [d for _, d in pending], agent="writer",
+            self.brain, [d for _, _, d in pending], agent="writer",
             enabled=humanizer_enabled(self.config),
         )
 
         drafted = 0
-        for (prospect, _), draft in zip(pending, polished):
-            draft = await self._keep_to_rules(draft, step=1, names=_names(prospect))
+        follow_ups = getattr(self.config.channels.email, "follow_ups", True)
+        dropped: set[str] = set()   # whose email 1 broke the rules: no follow-ups either
+        for (prospect, step, _), draft in zip(pending, polished):
+            if step > 1 and (not follow_ups or prospect.id in dropped):
+                continue
+            draft = await self._keep_to_rules(draft, step=step, names=_names(prospect))
             if draft is None:
+                if step == 1:
+                    dropped.add(prospect.id)
                 continue
             item_id = await self.state.add_outbox_item(
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
-                step=1,
+                step=step,
                 to_email=prospect.email,
                 subject=draft["subject"],
                 body=draft["body"],
+                # Follow-ups wait for the email before them (the sender's
+                # follow-up order), whatever their planned time.
                 send_at=now,
                 status=status,
                 provider=provider,
                 approved_by="" if require_approval else "autopilot",
             )
-            if item_id:
+            if item_id and step == 1:
                 drafted += 1
 
         if drafted:
@@ -463,6 +478,29 @@ class Writer:
                 f"Writer: drafted {drafted} personalized first email(s) "
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
+
+    async def _step_delays(self, campaign_id: str, sequence: list | None = None) -> list[int]:
+        """Each step's wait in days, step 1 first ([0] when unknown)."""
+        if sequence:
+            return [max(0, st.delay_days) for st in sorted(sequence, key=lambda st: st.step)]
+        delays = []
+        for step in range(1, 4):
+            d = await self.state.get_step_delay_days(campaign_id, step)
+            if d is None:
+                break
+            delays.append(d)
+        return delays or [0]
+
+    async def write_personal_drafts(self, prospect, delays: list[int]) -> list[dict]:
+        """Drafts for one person, step 1 first: the whole sequence, or just
+        email 1 when the sequence can't be written. [] when neither can."""
+        if len(delays) > 1 and getattr(getattr(self.config, "writer", None),
+                                       "personal_sequence", False):
+            sequence = await self._write_personal_sequence(prospect, delays)
+            if sequence:
+                return sequence
+        draft = await self._write_personal_email(prospect)
+        return [draft] if draft else []
 
     async def _startup(self, company_id) -> list[str] | None:
         """Fact lines when the company is a startup (YC, another accelerator,
@@ -517,8 +555,9 @@ class Writer:
             + lines
         )
 
-    async def _write_personal_email(self, prospect) -> dict | None:
-        """One grounded draft for one person. Facts in, one email out."""
+    async def _prospect_facts(self, prospect):
+        """(facts, inbox_rule, startup, about) for one person: what the writer
+        may say about them, and the text knowledge entries are matched on."""
         inbox_rule = ""
         if prospect.is_company_inbox:
             facts = [
@@ -561,6 +600,50 @@ class Writer:
         startup = await self._startup(prospect.company_id)
         if startup is not None:
             facts.extend(startup)
+        brief = await self._brief(company)
+        if brief:
+            facts.extend(brief_facts(brief))
+            better = clean_company_name(brief, prospect.company or "")
+            if better:
+                # Our name came from a search result ("X delivers 10000 ..."):
+                # use the one the site gives, here and in the templates.
+                facts = [f"- Company: {better}" if f.startswith("- Company:") else f
+                         for f in facts]
+                prospect.company = better
+                await self.state.update_prospect_company(prospect.id, better)
+        about = " ".join([prospect.industry or "", prospect.title or "", prospect.company or "",
+                          (company.description if company else "") or "",
+                          " ".join(str(v) for k, v in brief.items() if k != "sources")])
+        return facts, inbox_rule, startup, about
+
+    async def _brief(self, company) -> dict:
+        """The company's brief from its own site (sellbird.company_brief)."""
+        if company is None or getattr(self, "state", None) is None:
+            return {}
+        if not getattr(getattr(self.config, "writer", None), "company_brief", False):
+            return {}
+        try:
+            return await ensure_brief(self.state, self.brain, company)
+        except Exception as e:
+            logger.info(f"Writer: no brief for {company.domain}: {e}")
+            return {}
+
+    def _knowledge(self, about: str) -> str:
+        """The playbook sections and case study that match this prospect."""
+        return knowledge_block(self.brain.load_skill(PLAYBOOK) if self._has_skill(PLAYBOOK) else "",
+                               self.brain.load_skill(CASE_STUDIES) if self._has_skill(CASE_STUDIES) else "",
+                               about)
+
+    def _has_skill(self, name: str) -> bool:
+        try:
+            from sellbird.workspace_home import current_home
+            return (current_home().skills_dir / f"{name}.md").is_file()
+        except Exception:
+            return False
+
+    async def _write_personal_email(self, prospect) -> dict | None:
+        """One grounded draft for one person. Facts in, one email out."""
+        facts, inbox_rule, startup, about = await self._prospect_facts(prospect)
 
         prompt = self.brain.load_prompt(
             "writer",
@@ -578,6 +661,7 @@ class Writer:
         prompt += self._signal_guide("\n".join(facts))
         if startup is not None:
             prompt += self._startup_playbook()
+        prompt += self._knowledge(about)
         prompt += await self._feedback_block([prospect.id])
         rules = getattr(self, "email_rules", "")
         prompt += offer_block(self.config)
@@ -622,6 +706,86 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
         if not subject or not body:
             return None
         return {"subject": subject[:120], "body": body[:2000]}
+
+    async def _write_personal_sequence(self, prospect, delays: list[int]) -> list[dict] | None:
+        """All three emails for one person in one call, grounded in their
+        facts, their company's brief and the operator's matching knowledge.
+        None when the model's answer isn't three usable emails."""
+        facts, inbox_rule, startup, about = await self._prospect_facts(prospect)
+        prompt = self.brain.load_prompt(
+            "writer",
+            product_name=self.config.product.name,
+            product_description=self.config.product.description,
+            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
+            product_pricing=self.config.product.pricing,
+            persona_name=self.config.persona.name,
+            persona_company=self.config.persona.company,
+            persona_role=self.config.persona.role,
+            persona_tone=self.config.persona.tone,
+        ) or ""
+        if self.skills:
+            prompt += "\n\n" + self.skills
+        if startup is not None:
+            prompt += self._startup_playbook()
+        prompt += self._knowledge(about)
+        prompt += await self._feedback_block([prospect.id])
+        rules = getattr(self, "email_rules", "")
+        prompt += operator_rules_block(rules)
+        if rules:
+            shape = (
+                "- Follow the OPERATOR'S EMAIL RULES above for all three emails: their\n"
+                "  length, structure, what they say about the product, links and subjects.")
+            strict = "- Follow every STRICT EMAIL RULE above that the operator's rules don't replace."
+        else:
+            shape = (
+                "- Email 1 is the first touch (see the shape above). Email 2 follows up\n"
+                "  with a different, concrete angle for their plant. Email 3 is a short,\n"
+                "  polite close.")
+            strict = "- Follow every STRICT EMAIL RULE above."
+        gaps = ", ".join(f"email {i + 2} {d} days after the one before" for i, d in enumerate(delays[1:]))
+
+        prompt += f"""
+
+Write the whole sequence of THREE cold emails to this specific person
+({gaps or "follow-ups a few days apart"}). Each email must read as written for
+them: their company, what they make, their plant, their process. Never a
+template with a name swapped in.
+
+FACTS: everything you know about them, from their website and the web. Every
+claim about the prospect must come from these facts. If a fact isn't listed
+here, you don't know it: do not invent plants, numbers, customers, problems,
+mutual contacts or anything else. Where the product could fit them is your
+suggestion; word it as one ("could", "often", "in plants like yours"):
+{fence(chr(10).join(facts), "prospect research")}
+
+{UNTRUSTED_RULE}
+
+Requirements:
+{shape}
+- Write the actual text: no merge variables, no placeholders.
+- The three emails must not repeat each other's points or sentences.
+{footer_rule(self.config, rules)}
+{strict}{inbox_rule}
+
+Return ONLY JSON: {{"emails": [{{"subject": "...", "body": "..."}}, {{"subject": "...", "body": "..."}}, {{"subject": "...", "body": "..."}}]}}"""
+
+        result = await self.brain.think_json(
+            prompt, session_id="sellbird-writer",
+            agent="writer", task="personal_sequence",
+        )
+        emails = result.get("emails") if isinstance(result, dict) else None
+        if not isinstance(emails, list) or len(emails) < len(delays):
+            return None
+        out = []
+        for e in emails[:len(delays)]:
+            if not isinstance(e, dict):
+                return None
+            subject = str(e.get("subject") or "").strip()
+            body = str(e.get("body") or "").strip()
+            if not subject or not body or "{{" in subject + body:
+                return None
+            out.append({"subject": subject[:120], "body": body[:2000]})
+        return out
 
     async def _write_sequence(self, prospects: list) -> list[EmailStep]:
         """Ask the brain to write a 3-email sequence."""
