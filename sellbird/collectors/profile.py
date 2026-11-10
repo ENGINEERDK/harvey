@@ -23,7 +23,7 @@ import httpx
 from sellbird.public_http import public_http_client
 from sellbird.startups import funding_text
 
-from sellbird.collectors.ats import detect_board, matching_roles, read_board, role_keywords
+from sellbird.collectors.ats import detect_board, matching_roles, read_board, role_keywords, role_matches
 
 from sellbird.collectors.discover import (
     name_from_domain, name_matches_domain, site_name_from_html,
@@ -962,20 +962,22 @@ class ProfileCollector:
         if board and not chtml:
             curl, chtml = await self._careers_page(site, home, domain)
         if chtml and self.wants("HIRING_ROLE"):
+            keywords = getattr(self, "role_keywords", None) or []
             roles = []
             for m in re.finditer(
                 r"(?is)<(h[2-5]|a|li)[^>]*>\s*([^<]{6,70})\s*</\1>", _strip_code(chtml)
             ):
                 t = re.sub(r"\s+", " ", m.group(2)).strip()
-                if re.search(r"\b(hiring|apply|position|opening|wanted|"
-                             r"technician|installer|sales|manager|foreman|"
-                             r"estimator|crew|representative)\b", t, re.I):
-                    if t.lower() not in [r.lower() for r in roles]:
-                        roles.append(t)
+                if role_matches(t, keywords) and t.lower() not in [r.lower() for r in roles]:
+                    roles.append(t)
                 if len(roles) >= 3:
                     break
             for r in roles:
                 add("HIRING_ROLE", text=r, url=curl)
+            if not roles:
+                # Read the page and no listed role is one we look for: say
+                # so, so earlier rows stop being the current view.
+                add("HIRING_ROLE", num=0, url=curl)
     async def _search_hit(self, company_id: str, code: str) -> bool:
         """Is the latest reading a preset search's hit? (see state.search_hit)"""
         if getattr(self, "state", None) is None:

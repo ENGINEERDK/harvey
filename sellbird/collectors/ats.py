@@ -330,6 +330,17 @@ def role_keywords(icp) -> list[str]:
             if isinstance(t, str) and t.strip()]
 
 
+def role_matches(text: str, terms: list[str]) -> str:
+    """The first of ``terms`` found in ``text`` as whole words, or "".
+
+    Whole words, so "amr" doesn't match "Amrit". ``terms`` are lowercased."""
+    low = (text or "").lower()
+    for term in terms:
+        if re.search(rf"(?<![\w-]){re.escape(term)}(?![\w-])", low):
+            return term
+    return ""
+
+
 def matching_roles(postings: list[Posting], keywords: list[str]) -> list[Posting]:
     """Postings whose title holds every word of some keyword, in any order:
     "VP Marketing" matches "VP of Marketing", "cto" doesn't match "Director"."""

@@ -16,7 +16,7 @@ import pytest
 import pytest_asyncio
 
 from sellbird.collectors.ats import (
-    MAX_FEED_BYTES, Board, detect_board, feed_url, matching_roles, parse_feed,
+    MAX_FEED_BYTES, Board, detect_board, feed_url, matching_roles, parse_feed, role_matches,
     read_board, role_keywords,
 )
 from sellbird.collectors.discover import (
@@ -341,9 +341,41 @@ async def test_a_dead_board_falls_back_to_reading_the_careers_page():
     careers = ("<html>" + "y" * 600 + '<a href="https://jobs.lever.co/acme">Roles</a>'
                "<h3>Sales Manager</h3></html>")
     c = _collector({"HIRING_ROLE", "OPEN_ROLES"},
-                   {"https://acme.com": HOME, "https://acme.com/careers": careers}, {})
+                   {"https://acme.com": HOME, "https://acme.com/careers": careers}, {},
+                   keywords=("sales manager",))
     obs = await c.profile_company("c1", "acme.com")
     assert [(o["signal_code"], o["value_text"]) for o in obs] == [("HIRING_ROLE", "Sales Manager")]
+
+
+@pytest.mark.asyncio
+async def test_careers_page_link_text_is_not_a_role():
+    careers = "<html>" + "y" * 600 + "<a href='/x'>Apply Now</a><h3>Sales Executive</h3></html>"
+    c = _collector({"HIRING_ROLE"}, {"https://acme.com": HOME, "https://acme.com/careers": careers},
+                   {}, keywords=("store keeper", "forklift operator"))
+    obs = await c.profile_company("c1", "acme.com")
+    # Read the page, nothing we look for: the closing row, not "Apply Now".
+    assert [(o["value_num"], o["value_text"]) for o in obs] == [(0, "")]
+
+
+@pytest.mark.asyncio
+async def test_careers_page_keeps_a_role_we_look_for():
+    careers = "<html>" + "y" * 600 + "<li>Forklift Operator - Chakan</li><a href='/x'>Apply</a></html>"
+    c = _collector({"HIRING_ROLE"}, {"https://acme.com": HOME, "https://acme.com/careers": careers},
+                   {}, keywords=("forklift operator",))
+    obs = await c.profile_company("c1", "acme.com")
+    assert [o["value_text"] for o in obs] == ["Forklift Operator - Chakan"]
+
+
+@pytest.mark.parametrize("text,terms,expected", [
+    ("Forklift Operator", ["forklift operator"], "forklift operator"),
+    ("Mr Amrit Rao", ["amr"], ""),
+    ("AMR Engineer", ["amr"], "amr"),
+    ("Sr. Store Keeper (Chakan)", ["forklift", "store keeper"], "store keeper"),
+    ("Pre-AGV testing", ["agv"], ""),
+    ("", ["agv"], ""),
+])
+def test_role_matches_whole_words(text, terms, expected):
+    assert role_matches(text, terms) == expected
 
 
 @pytest.mark.asyncio

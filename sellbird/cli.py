@@ -574,6 +574,21 @@ def cmd_outbox(args):
     asyncio.run(_outbox())
 
 
+def cmd_amr(args):
+    """Fork-local tools for the AMR signals."""
+    from sellbird import amr
+    from sellbird.config import load_config
+    from sellbird.state import StateManager
+
+    async def _amr():
+        state = StateManager()
+        await state.init_db()
+        changed, closed = await amr.close_junk_hiring_rows(state, load_config())
+        print(f"\n  Closed {closed} junk hiring rows at {changed} companies.\n")
+
+    asyncio.run(_amr())
+
+
 def cmd_profile(args):
     """Read what companies' own websites say about them. Free, no Claude calls."""
     from sellbird.state import StateManager
@@ -1256,6 +1271,10 @@ def main():
     sub.add_argument("--stale-days", type=int, default=90,
                      help="Re-read a site after this many days (default: 90)")
     sub.set_defaults(func=cmd_profile)
+
+    sub = subparsers.add_parser("amr", help="Tools for the AMR buying signals")
+    sub.add_argument("amr_action", choices=["backfill-hiring"])
+    sub.set_defaults(func=cmd_amr)
 
     sub = subparsers.add_parser(
         "signals", help="Review/confirm which signals Sellbird prospects against")

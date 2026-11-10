@@ -18,8 +18,7 @@ A company on the do-not-contact list scores 0.
 
 from __future__ import annotations
 
-import re
-
+from sellbird.collectors.ats import role_matches
 from sellbird.collectors.people import title_matches
 from sellbird.gate import do_not_contact_match
 
@@ -30,15 +29,6 @@ DEAD_STATUSES = {"lost", "opted_out"}
 
 def _hiring_terms(icp) -> list[str]:
     return [t.strip().lower() for t in (getattr(icp, "hiring_signals", None) or []) if t.strip()]
-
-
-def _role_matches(text: str, terms: list[str]) -> str:
-    """The first hiring term found in ``text`` as whole words, or ""."""
-    low = (text or "").lower()
-    for term in terms:
-        if re.search(rf"(?<![\w-]){re.escape(term)}(?![\w-])", low):
-            return term
-    return ""
 
 
 def current_roles(observations: list[dict]) -> list[dict]:
@@ -107,7 +97,7 @@ def company_fit(company: dict, prospects: list[dict], observations: list[dict],
 
     terms = _hiring_terms(icp)
     roles = current_roles(observations)
-    hit = next((t for o in roles if (t := _role_matches(o.get("value_text"), terms))), "")
+    hit = next((t for o in roles if (t := role_matches(o.get("value_text"), terms))), "")
     if hit:
         score += BUYING
         reasons.append(f"hiring: {hit}")

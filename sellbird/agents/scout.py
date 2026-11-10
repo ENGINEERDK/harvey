@@ -38,6 +38,7 @@ from bs4 import BeautifulSoup
 
 from sellbird.brain import Brain
 from sellbird.collectors import people as people_mod
+from sellbird.collectors.ats import role_matches
 from sellbird.collectors.discover import site_name_from_html
 from sellbird.collectors.profile import _reads_like_title, fold_accents, looks_like_challenge
 from sellbird.config import SellbirdConfig, EnvConfig, live_do_not_contact
@@ -2145,7 +2146,7 @@ Respond ONLY with the JSON array."""
                 if not (4 <= len(text) <= 80):
                     continue
                 low = text.lower()
-                if not any(k in low for k in keywords):
+                if not role_matches(text, keywords):
                     continue
                 key = low[:60]
                 if key in seen:
