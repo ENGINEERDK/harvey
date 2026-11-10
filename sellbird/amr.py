@@ -337,3 +337,90 @@ async def brief_step(state, brain, config, limit: int = BRIEFS_PER_CYCLE) -> int
             break
         done += 1
     return done
+
+
+# ── Who gets written to (shared by the writer and the heartbeat's count) ──
+
+DRAFT_DAYS = 3
+
+
+async def no_floor_companies(state) -> set[str]:
+    """Companies whose current NO_PHYSICAL_OPERATION fact holds (confidence 0.8+)."""
+    from sellbird.fit import current_fact
+    rows = await state.get_observations(signal_code="NO_PHYSICAL_OPERATION", limit=1_000_000)
+    by: dict[str, list[dict]] = {}
+    for r in rows:
+        by.setdefault(r["company_id"], []).append(r)
+    return {cid for cid, obs in by.items() if current_fact(obs, "NO_PHYSICAL_OPERATION")}
+
+
+def gate_reason(title: str, company_id: str, config, no_floor: set[str]) -> str:
+    """Why this contact isn't written to, or "" when they can be."""
+    from sellbird.collectors.people import title_matches
+    excluded = getattr(getattr(config, "icp", None), "exclude_titles", None) or []
+    if excluded and title and title_matches(title, excluded):
+        return f"title not targeted: {title}"
+    if company_id and company_id in no_floor:
+        return "no plant or warehouse of its own"
+    return ""
+
+
+def min_write_score(config) -> int:
+    email = getattr(getattr(config, "channels", None), "email", None)
+    try:
+        return max(0, int(getattr(email, "min_write_score", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def unsent_cold(state) -> int:
+    async with state._connect() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'sequence' "
+            "AND status IN ('pending_review', 'approved')"
+        ) as cursor:
+            return (await cursor.fetchone())[0]
+
+
+def draft_room(config, unsent: int) -> int | None:
+    """How many more people can be drafted for: DRAFT_DAYS of today's cold
+    cap, less what's already waiting. None when there is no cap to go by."""
+    from sellbird.config import cold_daily_cap
+    email = getattr(getattr(config, "channels", None), "email", None)
+    if email is None or not hasattr(email, "max_daily_sends"):
+        return None
+    return max(0, DRAFT_DAYS * cold_daily_cap(email) - unsent)
+
+
+async def select_for_writing(state, brain, config, prospects: list) -> list:
+    """The prospects to draft for now: best company fit first, none whose title
+    or company is gated, and no more than draft_room allows. With the AMR
+    codes confirmed, a candidate's company is briefed first, so a company
+    found to have no floor is never drafted for."""
+    from sellbird.company_brief import ensure_brief
+    if not prospects:
+        return []
+    room = draft_room(config, await unsent_cold(state))
+    if room == 0:
+        return []
+    fits = await fit_scores(state, config)
+    ordered = sorted(prospects, key=lambda p: fits.get(p.company_id or "", 0), reverse=True)
+    briefing = bool(await confirmed_amr_codes(state)) and getattr(
+        getattr(config, "writer", None), "company_brief", False)
+    no_floor = await no_floor_companies(state)
+    chosen = []
+    for p in ordered:
+        if room is not None and len(chosen) >= room:
+            break
+        if gate_reason(p.title or "", "", config, set()):
+            continue
+        if briefing and p.company_id and p.company_id not in no_floor:
+            company = await state.get_company(p.company_id)
+            await ensure_brief(state, brain, company)
+            if getattr(brain, "paused_reason", ""):
+                break
+            no_floor = await no_floor_companies(state)
+        if gate_reason("", p.company_id or "", config, no_floor):
+            continue
+        chosen.append(p)
+    return chosen

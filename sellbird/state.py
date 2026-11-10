@@ -2448,17 +2448,27 @@ class StateManager:
                         return True
         return False
 
-    async def count_writable_prospects(self) -> int:
-        """New prospects the Writer can draft for (a deliverable email)."""
+    async def count_writable_prospects(self, config=None) -> int:
+        """New prospects the Writer can draft for (a deliverable email). With
+        ``config``, the same gates the Writer applies (sellbird.amr) too."""
         marks = ",".join("?" for _ in WRITABLE_EMAIL_STATUSES)
         async with self._connect() as db:
             async with db.execute(
-                f"""SELECT COUNT(*) FROM prospects p
+                f"""SELECT p.title, p.company_id, p.score FROM prospects p
                     WHERE status = 'new' AND email != ''
                       AND email_status IN ({marks}) AND NOT {_company_answered('p')}""",
                 WRITABLE_EMAIL_STATUSES,
             ) as cursor:
-                return (await cursor.fetchone())[0]
+                rows = await cursor.fetchall()
+        if config is None:
+            return len(rows)
+        from sellbird import amr
+        if amr.draft_room(config, await amr.unsent_cold(self)) == 0:
+            return 0     # enough already queued: the Writer won't draft now
+        floor, no_floor = amr.min_write_score(config), await amr.no_floor_companies(self)
+        return sum(1 for title, company_id, score in rows
+                   if (score or 0) >= floor
+                   and not amr.gate_reason(title or "", company_id or "", config, no_floor))
 
     async def count_recent_unusable_prospects(self, hours: int = 24) -> int:
         """New prospects found in the last ``hours`` that the Writer can't use."""
@@ -2913,7 +2923,7 @@ class StateManager:
 
     # ── Summary for Decision Making ──
 
-    async def get_state_summary(self) -> dict:
+    async def get_state_summary(self, config=None) -> dict:
         prospect_counts = await self.count_prospects_by_status()
         today = date.today().isoformat()
         async with self._connect() as db:
@@ -2946,7 +2956,7 @@ class StateManager:
             # The 'new' prospects the Writer can act on. A guessed or invalid
             # address stays 'new' forever, so deciding from the raw count
             # would keep choosing write_campaign with nothing to write.
-            "writable_prospects": await self.count_writable_prospects(),
+            "writable_prospects": await self.count_writable_prospects(config),
             # Unusable ones found in the last day: the heartbeat pauses
             # prospecting for the day when these alone fill the backlog.
             "recent_unusable_prospects": await self.count_recent_unusable_prospects(),

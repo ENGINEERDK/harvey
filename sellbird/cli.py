@@ -218,7 +218,12 @@ def cmd_status(args):
     async def _status():
         state = StateManager()
         await state.init_db()
-        summary = await state.get_state_summary()
+        try:
+            from sellbird.config import load_config
+            config = load_config()
+        except Exception:
+            config = None
+        summary = await state.get_state_summary(config)
 
         print("\n  Sellbird Pipeline Status")
         print("  " + "=" * 40)

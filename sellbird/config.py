@@ -74,6 +74,8 @@ class ICPConfig(BaseModel):
     # hiring a "Head of Growth" is buying growth tooling). Empty → falls back
     # to `titles`. Used for careers-page scanning and job-board discovery.
     hiring_signals: list[str] = []
+    # Titles never written to (word-based, as `titles`), e.g. ["CFO", "HR"].
+    exclude_titles: list[str] = []
     # Discovery needs a radius, not a place name. Maps each entry in
     # `geography` to "lat,lng,radius_km" — e.g.
     #   "Denver, CO": "39.7392,-104.9903,50"

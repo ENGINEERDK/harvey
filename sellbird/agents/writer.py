@@ -276,6 +276,16 @@ class Writer:
             if not prospects_with_email:
                 return
 
+        # Fork-local (sellbird.amr): best company fit first, never a gated
+        # title or a company with no floor, and no more than the sends of the
+        # next few days can use.
+        from sellbird import amr
+        prospects_with_email = await amr.select_for_writing(
+            self.state, self.brain, self.config, prospects_with_email)
+        if not prospects_with_email:
+            logger.info("Writer: Nobody to draft for now (gated, or enough already queued).")
+            return
+
         # Batch prospects into campaign groups (by industry/title for relevance)
         batches = self._group_prospects(prospects_with_email)
 

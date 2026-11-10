@@ -229,3 +229,88 @@ async def test_a_site_down_on_rebuild_keeps_the_good_brief(state, monkeypatch):
     monkeypatch.setattr(cb, "gather_pages", no_pages)
     brief = await cb.ensure_brief(state, _Brain({}), company)
     assert brief["makes"] == "Gear boxes" and brief["facts_failed"]
+
+
+# ── Who gets written to ──
+
+from sellbird.models.company import Company  # noqa: E402
+from sellbird.models.prospect import Prospect  # noqa: E402
+
+GATED = SimpleNamespace(
+    icp=SimpleNamespace(industries=["auto components manufacturer"], titles=["Plant Head"],
+                        hiring_signals=["forklift operator"], exclude_titles=["CFO", "HR"]),
+    compliance=SimpleNamespace(do_not_contact=[]),
+    channels=SimpleNamespace(email=SimpleNamespace(max_daily_sends=2, min_write_score=0)),
+    writer=SimpleNamespace(company_brief=False))
+
+
+async def _prospect(state, company, title, n):
+    p = Prospect(company_id=company.id, first_name=f"P{n}", last_name="X",
+                 email=f"p{n}@{company.domain}", email_status="verified", title=title,
+                 company=company.name)
+    p.id = await state.add_prospect(p)
+    return p
+
+
+def test_gate_reason():
+    assert amr.gate_reason("CFO", "c1", GATED, set()).startswith("title not targeted")
+    assert amr.gate_reason("Head of HR", "c1", GATED, set())
+    assert amr.gate_reason("Plant Head", "c1", GATED, {"c1"}) == "no plant or warehouse of its own"
+    assert amr.gate_reason("Plant Head", "c1", GATED, set()) == ""
+
+
+@pytest.mark.asyncio
+async def test_writer_and_count_agree_on_who_is_writable(state):
+    good = await _company(state, "good.example.com")
+    trader = await _company(state, "trader.example.com")
+    await state.add_observations([{"company_id": trader.id, "signal_code": "NO_PHYSICAL_OPERATION",
+                                   "collector": "amr_brief", "value_text": "trader", "confidence": 0.9}])
+    ps = [await _prospect(state, good, "Plant Head", 1), await _prospect(state, good, "CFO", 2),
+          await _prospect(state, trader, "Plant Head", 3)]
+    chosen = await amr.select_for_writing(state, _Brain({}), GATED, ps)
+    assert [p.first_name for p in chosen] == ["P1"]
+    assert await state.count_writable_prospects(GATED) == 1
+    assert await state.count_writable_prospects() == 3        # no config: the old count
+
+
+@pytest.mark.asyncio
+async def test_best_fit_first_and_no_more_than_three_days_of_sends(state):
+    weak = await _company(state, "weak.example.com")
+    weak_p = await _prospect(state, weak, "Plant Head", 1)
+    strong = Company(name="Strong", domain="strong.example.com", industry="auto components manufacturer")
+    await state.add_company(strong)
+    strong = await state.get_company_by_domain("strong.example.com")
+    await state.add_observations([{"company_id": strong.id, "signal_code": "PLI_BENEFICIARY",
+                                   "collector": "amr_brief", "value_text": "auto", "confidence": 0.9}])
+    ps = [weak_p] + [await _prospect(state, strong, "Plant Head", n) for n in range(2, 9)]
+    chosen = await amr.select_for_writing(state, _Brain({}), GATED, ps)
+    assert len(chosen) == 6                                  # 3 days x 2 a day
+    assert weak_p not in chosen                              # the weaker company waits
+
+
+@pytest.mark.asyncio
+async def test_a_full_queue_drafts_nothing_and_counts_nothing(state, monkeypatch):
+    good = await _company(state, "good.example.com")
+    ps = [await _prospect(state, good, "Plant Head", 1)]
+
+    async def full(_state):
+        return 6
+    monkeypatch.setattr(amr, "unsent_cold", full)
+    assert await amr.select_for_writing(state, _Brain({}), GATED, ps) == []
+    assert await state.count_writable_prospects(GATED) == 0
+
+
+@pytest.mark.asyncio
+async def test_with_codes_confirmed_the_company_is_briefed_before_drafting(state, monkeypatch):
+    company = await _company(state, "trader.example.com")
+    ps = [await _prospect(state, company, "Plant Head", 1)]
+    await _confirm_amr(state)
+
+    async def fake_pages(domain, news_paths=(), max_news=0):
+        return [(f"https://{domain}", "We are a trading house for bearings and seals across India.")]
+    monkeypatch.setattr(cb, "gather_pages", fake_pages)
+    brain = _Brain({"makes": "Bearings", "facts": {"no_physical_operation": {
+        "kind": "trader", "quote": "We are a trading house for bearings"}}})
+    config = SimpleNamespace(**{**vars(GATED), "writer": SimpleNamespace(company_brief=True)})
+    assert await amr.select_for_writing(state, brain, config, ps) == []
+    assert brain.calls == 1
