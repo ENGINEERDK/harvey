@@ -12,14 +12,17 @@ import csv
 import io
 
 from sellbird.config import ComplianceConfig, live_do_not_contact
-from sellbird.amr import AMR_CODES
-from sellbird.fit import company_fit, current_roles
+from sellbird.amr import AMR_CODES, facts_summary, present_codes
+from sellbird.fit import company_fit, current_fact, current_roles, fit_band
 from sellbird.gate import do_not_contact_match
 
 COLUMNS = [
     "company", "website", "sector", "area", "fit", "why_selected",
     "status", "why_not_contacted", "contacts", "contact_form", "hiring",
     "found_via", "first_found",
+    # Fork-local (sellbird.amr): the fit band, what the AMR facts say, and
+    # why the company isn't written to when it's gated.
+    "fit_band", "amr_facts", "gated",
 ]
 LIVE = {"new", "queued"}
 DONE = {"contacted", "replied", "meeting", "closed"}
@@ -155,6 +158,11 @@ async def build_register(query_db, config, company_id: str | None = None) -> lis
                 if o.get("value_text")))[:300],
             "found_via": c.get("source_url") or "",
             "first_found": (c.get("created_at") or "")[:10],
+            "fit_band": fit_band(fit),
+            "amr_facts": facts_summary(obs),
+            "gated": ("no plant or warehouse of its own"
+                      if current_fact(obs, "NO_PHYSICAL_OPERATION") else ""),
+            "signal_codes": present_codes(obs),   # for filters; not a CSV column
         })
     rows.sort(key=lambda r: r["fit"], reverse=True)
     return rows

@@ -421,6 +421,12 @@ def cmd_usage(args):
     asyncio.run(_usage())
 
 
+def _csv_arg(value) -> list[str] | None:
+    """A comma-separated option as a list, or None when not given."""
+    items = [v.strip() for v in (value or "").split(",") if v.strip()]
+    return items or None
+
+
 def cmd_companies(args):
     """Write the company register to a CSV and summarise it."""
     from collections import Counter
@@ -433,7 +439,9 @@ def cmd_companies(args):
     if not DB_PATH.exists():
         print("\n  No database yet: run 'sellbird discover' or 'sellbird run' first.\n")
         return
+    from sellbird.amr import matches_filters
     rows = asyncio.run(build_register(sqlite_query(DB_PATH), load_config()))
+    rows = [r for r in rows if matches_filters(r, _csv_arg(getattr(args, "industry", "")), _csv_arg(getattr(args, "signal", "")))]
     out = Path(args.out) if args.out else (
         PROJECT_ROOT / "data" / "exports" / f"company-register-{date.today():%Y-%m-%d}.csv")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -461,6 +469,11 @@ def cmd_export(args):
         if args.status:
             statuses = [s.strip() for s in args.status.split(",") if s.strip()]
 
+        try:
+            from sellbird.config import load_config
+            config = load_config()
+        except Exception:
+            config = None
         count, _ = await export_prospects_csv(
             state,
             out_path=args.out,
@@ -468,6 +481,9 @@ def cmd_export(args):
             min_score=args.min_score,
             statuses=statuses,
             include_all=args.all,
+            config=config,
+            industries=_csv_arg(getattr(args, "industry", "")),
+            signals=_csv_arg(getattr(args, "signal", "")),
         )
         scope = "all prospects" if args.all else (
             f"email status {email_statuses or ['verified', 'risky']}"
@@ -1229,6 +1245,11 @@ def main():
     sub.add_argument("--min-score", type=int, default=0, help="Minimum ICP score")
     sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued); opted-out contacts stay excluded")
     sub.add_argument("--all", action="store_true", help="Export the raw list without filters, including opted-out contacts (not for outreach)")
+    sub.add_argument("--industry", default="",
+                     help="Comma-separated sector words, e.g. \"electronics\" (any matches)")
+    sub.add_argument("--signal", default="",
+                     help="Comma-separated codes the company must carry, e.g. "
+                          "EXPANSION_NEWS,HIRING_ROLE (AMR codes and HIRING_ROLE)")
     sub.set_defaults(func=cmd_export)
 
     # sellbird companies
@@ -1236,6 +1257,11 @@ def main():
         "companies", help="Export the company register: every company, why it fits, and why it wasn't contacted"
     )
     sub.add_argument("--out", default="", help="Output file (default: data/exports/company-register-<date>.csv)")
+    sub.add_argument("--industry", default="",
+                     help="Comma-separated sector words, e.g. \"electronics\" (any matches)")
+    sub.add_argument("--signal", default="",
+                     help="Comma-separated codes the company must carry, e.g. "
+                          "EXPANSION_NEWS,HIRING_ROLE (AMR codes and HIRING_ROLE)")
     sub.set_defaults(func=cmd_companies)
 
     # sellbird gmail auth|test

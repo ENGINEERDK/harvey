@@ -21,6 +21,7 @@ CSV_COLUMNS = [
     "email", "first_name", "last_name", "company_name", "title",
     "website", "linkedin_url", "industry", "personalization",
     "email_status", "score", "seniority", "source", "status", "created_at",
+    "fit_band", "amr_facts",
 ]
 
 DEFAULT_EMAIL_STATUSES = ["verified", "risky"]
@@ -33,6 +34,8 @@ async def collect_prospects(
     statuses: list[str] | None = None,
     include_all: bool = False,
     config=None,
+    industries: list[str] | None = None,
+    signals: list[str] | None = None,
 ) -> list[dict]:
     """Fetch prospects matching the filters as export-ready dicts.
 
@@ -80,8 +83,19 @@ async def collect_prospects(
         rows = [r for r in rows
                 if not do_not_contact_match(r.get("email") or "", _do_not_contact(config))]
 
+    # Fork-local (sellbird.amr): each contact's company fit band and AMR
+    # facts, and the --industry / --signal filters, from the company register.
+    from sellbird.register import build_register, sqlite_query
+    from sellbird.amr import matches_filters
+    companies = {c["id"]: c for c in await build_register(sqlite_query(state.db_path), config)}
+    if industries or signals:
+        rows = [r for r in rows
+                if matches_filters(companies.get(r.get("company_id") or "")
+                                   or {"sector": r.get("industry") or ""}, industries, signals)]
+
     out = []
     for r in rows:
+        company = companies.get(r.get("company_id") or "") or {}
         out.append({
             "email": r.get("email", ""),
             "first_name": r.get("first_name", ""),
@@ -98,6 +112,8 @@ async def collect_prospects(
             "source": r.get("source", ""),
             "status": r.get("status", ""),
             "created_at": r.get("created_at", ""),
+            "fit_band": company.get("fit_band", ""),
+            "amr_facts": company.get("amr_facts", ""),
         })
     return out
 
@@ -135,6 +151,8 @@ async def export_prospects_csv(
     statuses: list[str] | None = None,
     include_all: bool = False,
     config=None,
+    industries: list[str] | None = None,
+    signals: list[str] | None = None,
 ) -> tuple[int, str]:
     """Export prospects to CSV. Returns (row_count, csv_text).
 
@@ -147,6 +165,8 @@ async def export_prospects_csv(
         statuses=statuses,
         include_all=include_all,
         config=config,
+        industries=industries,
+        signals=signals,
     )
     text = to_csv(rows)
     if out_path:

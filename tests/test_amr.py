@@ -386,3 +386,46 @@ async def test_clear_lifts_a_wrong_block_for_good(state):
     assert await amr.record_facts(state, company.id, facts) == 0
     with pytest.raises(ValueError):
         await amr.clear_fact(state, "acme.example.com", "HIRING_ROLE")
+
+
+# ── Exports ──
+
+from datetime import datetime, timezone  # noqa: E402
+
+from tests.test_fit import fact  # noqa: E402
+
+def test_present_codes_and_summary():
+    now = datetime.now(timezone.utc)
+    obs = [fact("EXPANSION_NEWS", now.year * 100 + now.month, "new plant"),
+           fact("PLANT_COUNT", 3), fact("CERTIFICATION", text="IATF 16949"),
+           fact("PLI_BENEFICIARY", text="x", conf=0.5)]
+    assert amr.present_codes(obs) == ["EXPANSION_NEWS", "PLANT_COUNT", "CERTIFICATION"]
+    summary = amr.facts_summary(obs)
+    assert "expanding: new plant" in summary and "3 plants" in summary and "IATF 16949" in summary
+    assert "PLI" not in summary
+
+
+def test_matches_filters():
+    row = {"sector": "electronics manufacturing company", "signal_codes": ["EXPANSION_NEWS"]}
+    assert amr.matches_filters(row, ["Electronics"], None)
+    assert not amr.matches_filters(row, ["pharma"], None)
+    assert amr.matches_filters(row, None, ["expansion_news"])
+    assert not amr.matches_filters(row, ["electronics"], ["EXPANSION_NEWS", "PLI_BENEFICIARY"])
+
+
+@pytest.mark.asyncio
+async def test_export_filters_by_industry_and_status(state):
+    from sellbird.export import collect_prospects
+    elec = await _company(state, "elec.example.com")
+    async with state._connect() as db:
+        await db.execute("UPDATE companies SET industry = 'electronics manufacturing company' "
+                         "WHERE id = ?", (elec.id,))
+        await db.commit()
+    pharma = await _company(state, "pharma.example.com")
+    a = await _prospect(state, elec, "Plant Head", 1)
+    await _prospect(state, pharma, "Plant Head", 2)
+    await state.update_prospect_status(a.id, "replied")
+    rows = await collect_prospects(state, statuses=["replied"], config=GATED,
+                                   industries=["electronics"])
+    assert [r["first_name"] for r in rows] == ["P1"]
+    assert rows[0]["fit_band"] in ("A", "B", "C")

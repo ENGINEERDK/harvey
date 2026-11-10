@@ -495,3 +495,69 @@ async def clear_fact(state, domain: str, code: str = "NO_PHYSICAL_OPERATION") ->
     await state.add_observations([{"company_id": company.id, "signal_code": code,
                                    "collector": MANUAL, "value_num": 0}])
     return True
+
+
+# ── Exports: AMR columns and filters ──
+
+def present_codes(observations: list[dict]) -> list[str]:
+    """The AMR codes a company carries now (confidence 0.8+; an expansion
+    only within its 24 months), plus HIRING_ROLE when a current role matches."""
+    from sellbird.fit import current_fact, recent_expansion
+    codes = []
+    for code in AMR_CODES:
+        rows = current_fact(observations, code)
+        if code == "EXPANSION_NEWS":
+            rows = [o for o in rows if recent_expansion(o.get("value_num"))]
+        if rows:
+            codes.append(code)
+    if any((o.get("value_text") or "").strip() for o in current_roles(observations)):
+        codes.append("HIRING_ROLE")
+    return codes
+
+
+def facts_summary(observations: list[dict]) -> str:
+    """One readable cell: what the AMR facts say about a company."""
+    from sellbird.fit import current_fact, recent_expansion
+    parts = []
+
+    def first(code):
+        rows = current_fact(observations, code)
+        return rows[0] if rows else None
+
+    if (o := first("EXPANSION_NEWS")) and recent_expansion(o.get("value_num")):
+        y, m = divmod(int(o["value_num"]), 100)
+        parts.append(f"expanding: {o.get('value_text') or 'new capacity'} ({y}-{m:02d})")
+    if o := first("PLI_BENEFICIARY"):
+        parts.append(f"PLI: {o.get('value_text')}")
+    if (o := first("PLANT_COUNT")) and o.get("value_num"):
+        parts.append(f"{int(o['value_num'])} plants")
+    if (o := first("EMPLOYEE_BAND")) and o.get("value_num"):
+        parts.append(f"{int(o['value_num'])} employees")
+    if (o := first("AUTOMATION_LEVEL")) is not None and o.get("value_num") is not None:
+        parts.append(f"automation {int(o['value_num'])}/3")
+    if o := first("INTRALOGISTICS"):
+        parts.append(f"material flow: {o.get('value_text')}")
+    if o := first("EXISTING_AGV"):
+        parts.append(f"has AGVs: {o.get('value_text')}")
+    certs = [o.get("value_text") for o in current_fact(observations, "CERTIFICATION")]
+    if certs:
+        parts.append("certified: " + ", ".join(sorted(set(c for c in certs if c))))
+    if o := first("MNC_SUBSIDIARY"):
+        parts.append(f"part of {o.get('value_text')}")
+    if o := first("NO_PHYSICAL_OPERATION"):
+        parts.append(f"no plant/warehouse ({o.get('value_text')})")
+    return "; ".join(parts)[:400]
+
+
+def matches_filters(row: dict, industries: list[str] | None, signals: list[str] | None) -> bool:
+    """Register-row filter: sector contains any of ``industries``, and the
+    company carries every one of ``signals``."""
+    if industries:
+        sector = (row.get("sector") or "").lower()
+        if not any(i.strip().lower() in sector for i in industries if i.strip()):
+            return False
+    if signals:
+        have = set(row.get("signal_codes") or [])
+        if not all(s.strip().upper() in have for s in signals if s.strip()):
+            return False
+    return True
