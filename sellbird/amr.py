@@ -428,3 +428,70 @@ async def select_for_writing(state, brain, config, prospects: list) -> list:
 # Outbox note on a cold email held because its contact is gated now. Starts
 # with state.HELD_FOR_REVIEW, so "approve all" leaves it for a person.
 GATE_HELD = "held for your review: not targeted now: "
+
+
+# ── sellbird amr check / clear ──
+
+MIN_REJECTS = 5
+
+
+def read_screen(path: str) -> list[dict]:
+    """The hand screen: a CSV with a domain (or website) column, a verdict
+    column (keep or reject) and an optional reason column."""
+    import csv
+    rows = []
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        for raw in csv.DictReader(fh):
+            row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items()}
+            domain = (row.get("domain") or row.get("website") or "").lower()
+            domain = re.sub(r"^https?://", "", domain).removeprefix("www.").split("/")[0]
+            verdict = row.get("verdict", "").lower()
+            if domain and verdict in ("keep", "reject"):
+                rows.append({"domain": domain, "verdict": verdict, "reason": row.get("reason", ""),
+                             "name": row.get("company") or row.get("name") or ""})
+    return rows
+
+
+async def check_screen(brain, screen: list[dict]) -> tuple[list[str], bool]:
+    """Brief each screened company with the facts prompt, writing nothing, and
+    compare. Passes only with MIN_REJECTS+ rejects in the screen and no kept
+    company marked as having no plant or warehouse of its own."""
+    from sellbird.company_brief import build_brief
+    lines, wrong_blocks = [], []
+    for row in screen:
+        brief = await build_brief(brain, row["name"], row["domain"], facts=True)
+        if getattr(brain, "paused_reason", ""):
+            lines.append(f"  stopped: {brain.paused_reason}")
+            return lines, False
+        facts = brief.get("facts") or {}
+        blocked = "no_physical_operation" in facts
+        if blocked and row["verdict"] == "keep":
+            wrong_blocks.append(row["domain"])
+        found = ", ".join(sorted(facts)) or ("facts failed" if brief.get("facts_failed")
+                                              else brief.get("failed") or "no facts")
+        lines.append(f"  {row['verdict']:6} {row['domain']:32} {'BLOCKED ' if blocked else ''}"
+                     f"{found}  | your reason: {row['reason']}")
+    rejects = sum(1 for r in screen if r["verdict"] == "reject")
+    passed = not wrong_blocks and rejects >= MIN_REJECTS
+    if rejects < MIN_REJECTS:
+        lines.append(f"  FAIL: the screen has {rejects} rejects; it needs at least {MIN_REJECTS}.")
+    if wrong_blocks:
+        lines.append("  FAIL: good plants marked as having no floor: " + ", ".join(wrong_blocks))
+    if passed:
+        lines.append("  PASS: no good plant blocked. Confirm the AMR signals with:\n"
+                     "    sellbird signals --confirm " + ",".join(AMR_CODES))
+    return lines, passed
+
+
+async def clear_fact(state, domain: str, code: str = "NO_PHYSICAL_OPERATION") -> bool:
+    """A person says this fact is wrong for this company: close it, and the
+    brief never writes it back (MANUAL)."""
+    code = code.upper()
+    if code not in AMR_CODES:
+        raise ValueError(f"{code} isn't an AMR signal ({', '.join(AMR_CODES)})")
+    company = await state.get_company_by_domain(domain)
+    if company is None:
+        return False
+    await state.add_observations([{"company_id": company.id, "signal_code": code,
+                                   "collector": MANUAL, "value_num": 0}])
+    return True

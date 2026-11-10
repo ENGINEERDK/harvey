@@ -314,3 +314,75 @@ async def test_with_codes_confirmed_the_company_is_briefed_before_drafting(state
     config = SimpleNamespace(**{**vars(GATED), "writer": SimpleNamespace(company_brief=True)})
     assert await amr.select_for_writing(state, brain, config, ps) == []
     assert brain.calls == 1
+
+
+# ── sellbird amr check / clear ──
+
+def _screen(tmp_path, rows):
+    path = tmp_path / "screen.csv"
+    path.write_text("domain,verdict,reason\n" + "".join(f"{d},{v},{r}\n" for d, v, r in rows))
+    return str(path)
+
+
+def test_read_screen_normalises_domains(tmp_path):
+    path = _screen(tmp_path, [("https://www.acme.example.com/about", "Keep", "good"),
+                              ("bad.example.com", "maybe", "skip me")])
+    assert amr.read_screen(path) == [{"domain": "acme.example.com", "verdict": "keep",
+                                      "reason": "good", "name": ""}]
+
+
+class _ByDomain(_Brain):
+    def __init__(self, blocked):
+        super().__init__({})
+        self.blocked = blocked
+        self.domain = ""
+
+    async def think_json(self, prompt, **_):
+        self.calls += 1
+        if any(d in prompt for d in self.blocked):
+            return {"makes": "x", "facts": {"no_physical_operation": {
+                "kind": "trader", "quote": "Acme makes gear boxes"}}}
+        return {"makes": "x", "facts": {}}
+
+
+@pytest.mark.asyncio
+async def test_check_passes_when_no_good_plant_is_blocked(pages):
+    screen = [{"domain": f"r{i}.example.com", "verdict": "reject", "reason": "", "name": ""}
+              for i in range(5)] + [{"domain": "good.example.com", "verdict": "keep", "reason": "", "name": ""}]
+    lines, passed = await amr.check_screen(_ByDomain(["r0.example.com"]), screen)
+    assert passed and "PASS" in lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_check_fails_on_a_wrong_block_or_too_few_rejects(pages):
+    good = {"domain": "good.example.com", "verdict": "keep", "reason": "", "name": ""}
+    rejects = [{"domain": f"r{i}.example.com", "verdict": "reject", "reason": "", "name": ""}
+               for i in range(5)]
+    assert not (await amr.check_screen(_ByDomain(["good.example.com"]), rejects + [good]))[1]
+    assert not (await amr.check_screen(_ByDomain([]), rejects[:4] + [good]))[1]
+
+
+@pytest.mark.asyncio
+async def test_check_writes_nothing(state, pages):
+    await _company(state)
+    await _confirm_amr(state)
+    before = len(await state.get_observations(limit=100000))
+    await amr.check_screen(_ByDomain(["acme.example.com"]),
+                           [{"domain": "acme.example.com", "verdict": "keep", "reason": "", "name": ""}])
+    assert len(await state.get_observations(limit=100000)) == before
+    assert (await state.get_company_brief((await state.get_company_by_domain("acme.example.com")).id))[0] == {}
+
+
+@pytest.mark.asyncio
+async def test_clear_lifts_a_wrong_block_for_good(state):
+    company = await _company(state)
+    await _confirm_amr(state)
+    facts = {"no_physical_operation": {"kind": "trader", "quote": "q", "evidence_url": "https://a"}}
+    await amr.record_facts(state, company.id, facts)
+    assert company.id in await amr.no_floor_companies(state)
+    await asyncio.sleep(1.1)
+    assert await amr.clear_fact(state, "acme.example.com")
+    assert company.id not in await amr.no_floor_companies(state)
+    assert await amr.record_facts(state, company.id, facts) == 0
+    with pytest.raises(ValueError):
+        await amr.clear_fact(state, "acme.example.com", "HIRING_ROLE")

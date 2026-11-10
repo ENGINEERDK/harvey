@@ -588,8 +588,26 @@ def cmd_amr(args):
     async def _amr():
         state = StateManager()
         await state.init_db()
-        changed, closed = await amr.close_junk_hiring_rows(state, load_config())
-        print(f"\n  Closed {closed} junk hiring rows at {changed} companies.\n")
+        config = load_config()
+        if args.amr_action == "backfill-hiring":
+            changed, closed = await amr.close_junk_hiring_rows(state, config)
+            print(f"\n  Closed {closed} junk hiring rows at {changed} companies.\n")
+        elif args.amr_action == "check":
+            if not args.companies:
+                sys.exit("  sellbird amr check --companies screen.csv (columns: domain, verdict, reason)")
+            from sellbird.brain import Brain
+            screen = amr.read_screen(args.companies)
+            print(f"\n  Briefing {len(screen)} screened companies (nothing is written)...\n")
+            lines, passed = await amr.check_screen(Brain(state, config.brain), screen)
+            print("\n".join(lines) + "\n")
+            if not passed:
+                sys.exit(1)
+        else:
+            if not args.target:
+                sys.exit("  sellbird amr clear <domain> [CODE]   (CODE defaults to NO_PHYSICAL_OPERATION)")
+            code = args.target[1] if len(args.target) > 1 else "NO_PHYSICAL_OPERATION"
+            ok = await amr.clear_fact(state, args.target[0], code)
+            print(f"\n  {'Cleared' if ok else 'No company with domain'} {code} for {args.target[0]}.\n")
 
     asyncio.run(_amr())
 
@@ -1278,7 +1296,11 @@ def main():
     sub.set_defaults(func=cmd_profile)
 
     sub = subparsers.add_parser("amr", help="Tools for the AMR buying signals")
-    sub.add_argument("amr_action", choices=["backfill-hiring"])
+    sub.add_argument("amr_action", choices=["backfill-hiring", "check", "clear"],
+                     help="backfill-hiring: close junk hiring rows; check: dry run on your "
+                          "hand screen; clear: a person says a fact is wrong")
+    sub.add_argument("target", nargs="*", help="clear: <domain> [CODE]")
+    sub.add_argument("--companies", default="", help="check: the hand-screen CSV")
     sub.set_defaults(func=cmd_amr)
 
     sub = subparsers.add_parser(
