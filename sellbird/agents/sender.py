@@ -837,6 +837,14 @@ class Sender:
             colleague = await self.state.colleague_who_replied(prospect.id)
             if colleague:
                 return "cancelled", f"{COLLEAGUE_REPLIED} ({colleague})"
+            # Fork-local (sellbird.amr): a contact gated since this was
+            # drafted goes back to you, unless you approved it after a hold.
+            if not item.get("gate_override_at"):
+                from sellbird import amr
+                held = amr.gate_reason(prospect.title or "", prospect.company_id or "",
+                                       self.config, await amr.no_floor_companies(self.state))
+                if held:
+                    return "pending_review", (amr.GATE_HELD + held)[:300]
         # Sellbird's writing rules (no dashes, no exclamation marks, no AI
         # phrases): a draft that breaks them waits for an edit instead of
         # going out. Length and shape were checked when it was written, so an

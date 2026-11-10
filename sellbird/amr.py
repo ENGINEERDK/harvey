@@ -424,3 +424,7 @@ async def select_for_writing(state, brain, config, prospects: list) -> list:
             continue
         chosen.append(p)
     return chosen
+
+# Outbox note on a cold email held because its contact is gated now. Starts
+# with state.HELD_FOR_REVIEW, so "approve all" leaves it for a person.
+GATE_HELD = "held for your review: not targeted now: "

@@ -569,6 +569,9 @@ LOCAL_COLUMNS: list[tuple[str, str, str]] = [
     # when it was written (or last failed).
     ("companies", "brief_json", "TEXT DEFAULT ''"),
     ("companies", "brief_at", "TIMESTAMP DEFAULT NULL"),
+    # When a person approved a cold email the AMR gate had held (sellbird.amr):
+    # set, it goes out without being held again.
+    ("outbox", "gate_override_at", "TIMESTAMP DEFAULT NULL"),
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -1413,10 +1416,14 @@ class StateManager:
         and any reason it was held is cleared."""
         async with self._connect() as db:
             if item_id:
+                from sellbird.amr import GATE_HELD
+                now = _utcnow().isoformat()
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
+                    "UPDATE outbox SET status = 'approved', approved_by = 'you', "
+                    "gate_override_at = CASE WHEN COALESCE(error, '') LIKE ? THEN ? "
+                    "ELSE gate_override_at END, error = '', "
                     "updated_at = ? WHERE id = ? AND status = 'pending_review'",
-                    (_utcnow().isoformat(), item_id),
+                    (GATE_HELD + "%", now, now, item_id),
                 )
             else:
                 # Not the ones autopilot held for a look (possible planted
