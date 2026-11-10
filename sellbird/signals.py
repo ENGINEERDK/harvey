@@ -387,6 +387,10 @@ SIGNAL_CATALOG: list[dict] = [
 ]
 
 
+# Fork-local: the AMR buying signals (sellbird/amr.py), proposed like the rest.
+from sellbird.amr import AMR_SIGNALS as _AMR_SIGNALS  # noqa: E402
+SIGNAL_CATALOG += _AMR_SIGNALS
+
 _SEEDED_FIELDS = ("label", "description", "category", "value_type", "collector", "cost_note")
 
 

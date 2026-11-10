@@ -465,6 +465,16 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                     await record_send_phase(state, send_hold_reason([], "", ""))
                     await _run_agents([(name, run()) for name, run in send_tasks])
 
+            # Fork-local: AMR facts for the next companies (sellbird.amr). Not
+            # on send-only cycles; bounded, and a failure never stops the loop.
+            if action != "quiet_hours_send":
+                try:
+                    from sellbird.amr import brief_step
+                    await asyncio.wait_for(brief_step(state, brain, config),
+                                           timeout=CYCLE_TIMEOUT_SECONDS)
+                except Exception as e:
+                    logger.warning(f"AMR briefs skipped this cycle: {e}")
+
             # 6. Log the action (best-effort; never kills the loop)
             try:
                 await state.log_action(action_type=action, agent="main")

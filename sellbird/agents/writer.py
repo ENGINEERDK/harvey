@@ -613,7 +613,8 @@ class Writer:
                 await self.state.update_prospect_company(prospect.id, better)
         about = " ".join([prospect.industry or "", prospect.title or "", prospect.company or "",
                           (company.description if company else "") or "",
-                          " ".join(str(v) for k, v in brief.items() if k != "sources")])
+                          " ".join(str(v) for k, v in brief.items()
+                                   if k not in ("sources", "facts", "facts_failed"))])
         return facts, inbox_rule, startup, about
 
     async def _brief(self, company) -> dict:

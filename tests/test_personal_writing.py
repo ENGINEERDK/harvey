@@ -97,7 +97,7 @@ async def test_brief_is_built_once_then_reused(tmp_path, monkeypatch):
     company = await state.get_company(cid)
     calls = []
 
-    async def fake_build(brain, name, domain):
+    async def fake_build(brain, name, domain, facts=False):
         calls.append(domain)
         return {"makes": "Gear boxes", "sources": "https://example.test"}
     monkeypatch.setattr(cb, "build_brief", fake_build)
@@ -113,7 +113,7 @@ async def test_no_failure_is_recorded_while_the_model_is_unavailable(tmp_path, m
     await state.init_db()
     cid = await state.add_company(Company(name="Example Gears", domain="example.test"))
 
-    async def fake_build(brain, name, domain):
+    async def fake_build(brain, name, domain, facts=False):
         return {"failed": "nothing usable on the site"}
     monkeypatch.setattr(cb, "build_brief", fake_build)
     brain = SimpleNamespace(paused_reason="usage limit")

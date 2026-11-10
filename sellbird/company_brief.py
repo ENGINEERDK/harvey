@@ -110,8 +110,9 @@ def brief_facts(brief: dict) -> list[str]:
     return lines
 
 
-async def gather_pages(domain: str) -> list[tuple[str, str]]:
-    """Up to MAX_PAGES (url, visible text) of the company's own site."""
+async def gather_pages(domain: str, news_paths=(), max_news: int = 0) -> list[tuple[str, str]]:
+    """Up to MAX_PAGES (url, visible text) of the company's own site, plus up
+    to ``max_news`` of ``news_paths`` (where announcements live)."""
     from sellbird.collectors.profile import ProfileCollector, _text
 
     pages: list[tuple[str, str]] = []
@@ -129,10 +130,21 @@ async def gather_pages(domain: str) -> list[tuple[str, str]]:
                 # A path that redirects to the homepage adds nothing.
                 if text and text[:400] != pages[0][1][:400]:
                     pages.append((f"{site}{path}", text))
+        news = 0
+        for path in news_paths:
+            if news >= max_news:
+                break
+            html = await prof._get(f"{site}{path}")
+            if html and len(html) > 500:
+                text = _text(html)[:PAGE_CHARS]
+                if text and text[:400] != pages[0][1][:400]:
+                    pages.append((f"{site}{path}", text))
+                    news += 1
     return pages
 
 
-def brief_prompt(company_name: str, domain: str, pages: list[tuple[str, str]]) -> str:
+def brief_prompt(company_name: str, domain: str, pages: list[tuple[str, str]],
+                 facts: bool = False) -> str:
     text = "\n\n".join(f"PAGE {url}\n{body}" for url, body in pages)
     return f"""You are reading a company's own website to brief a salesperson.
 
@@ -158,44 +170,75 @@ Fields:
   conveyors, forklifts, automation or material handling
 - growth: expansion, new plants or lines, capacity additions, new contracts
 - customers: customers they name
+{_facts_section() if facts else ""}
+Return JSON with exactly these keys: {", ".join(FIELDS + (("facts",) if facts else ()))}"""
 
-Return JSON with exactly these keys: {", ".join(FIELDS)}"""
+
+def _facts_section() -> str:
+    from sellbird.amr import FACTS_PROMPT
+    return FACTS_PROMPT + "\n"
 
 
-async def build_brief(brain, company_name: str, domain: str) -> dict:
-    """Read the site and summarise it. {"failed": reason} when it can't."""
+async def build_brief(brain, company_name: str, domain: str, facts: bool = False) -> dict:
+    """Read the site and summarise it. {"failed": reason} when it can't.
+
+    With ``facts`` (an AMR code is confirmed) it also reads news pages and
+    returns validated "facts", or "facts_failed" when there were none to read."""
     if not domain:
         return {"failed": "no website"}
     try:
-        pages = await gather_pages(domain)
+        if facts:
+            from sellbird.amr import MAX_NEWS_PAGES, NEWS_PATHS
+            pages = await gather_pages(domain, NEWS_PATHS, MAX_NEWS_PAGES)
+        else:
+            pages = await gather_pages(domain)
     except Exception as e:  # a bad site must never stop the writer
         logger.info(f"brief: {domain} couldn't be read ({e})")
         pages = []
     if not pages:
         return {"failed": "site unreachable"}
     result = await brain.think_json(
-        brief_prompt(company_name, domain, pages),
+        brief_prompt(company_name, domain, pages, facts=facts),
         session_id="sellbird-brief", agent="writer", task="company_brief",
     )
     brief = clean_brief(result)
     if not brief:
         return {"failed": "nothing usable on the site"}
     brief["sources"] = ", ".join(url for url, _ in pages)
+    if facts:
+        from sellbird.amr import validate_facts
+        checked = validate_facts(result.get("facts") if isinstance(result, dict) else None, pages)
+        if checked is None:
+            brief["facts_failed"] = True
+        else:
+            brief["facts"] = checked
     return brief
 
 
 async def ensure_brief(state, brain, company) -> dict:
-    """The company's brief, built now if it's missing or stale."""
+    """The company's brief, built now if it's missing or stale.
+
+    Once an AMR code is confirmed (sellbird.amr), a brief without facts is
+    stale too, and a fresh brief's facts are recorded as observations."""
     if company is None:
         return {}
+    from sellbird import amr
     brief, stamp = await state.get_company_brief(company.id)
-    if is_fresh(brief, stamp):
+    want_facts = bool(await amr.confirmed_amr_codes(state))
+    if is_fresh(brief, stamp) and not (want_facts and amr.needs_facts(brief, stamp)):
         return brief
-    brief = await build_brief(brain, company.name or "", company.domain or "")
+    old = brief
+    brief = await build_brief(brain, company.name or "", company.domain or "", facts=want_facts)
     if getattr(brain, "paused_reason", ""):
         # The model was unavailable, not the site: don't record a failure.
         return {}
+    if brief.get("failed") and old and not old.get("failed"):
+        # A site that's down today doesn't undo a good brief: keep it, and
+        # note the facts attempt so it's retried later, not every cycle.
+        brief = {**old, "facts_failed": True} if want_facts else old
     await state.set_company_brief(company.id, brief)
+    if want_facts and "facts" in brief and brief is not old:
+        await amr.record_facts(state, company.id, brief["facts"])
     return brief
 
 
