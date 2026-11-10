@@ -93,3 +93,66 @@ def test_a_contact_on_the_do_not_contact_list_doesnt_count():
     jo = {**person(), "email": "jo@acme.example"}
     score, _ = company_fit(ACME, [jo], [], config(dnc=["jo@acme.example"]))
     assert score == 20
+
+
+# ── AMR facts (sellbird/amr.py) ──
+
+from datetime import datetime, timezone  # noqa: E402
+
+import pytest  # noqa: E402
+
+from sellbird.fit import fit_band, recent_expansion  # noqa: E402
+
+
+def fact(code, num=None, text="", conf=0.9, at="2026-11-01 10:00:00"):
+    return {"signal_code": code, "value_num": num, "value_text": text, "confidence": conf,
+            "observed_at": at}
+
+
+BASE = [person()]   # sector 20 + decision maker 30 + verified 25 = 75
+
+
+@pytest.mark.parametrize("obs,points", [
+    ([fact("PLI_BENEFICIARY", text="auto")], 20),
+    ([fact("AUTOMATION_LEVEL", 2)], 15),
+    ([fact("AUTOMATION_LEVEL", 1)], 0),
+    ([fact("PLANT_COUNT", 3)], 10),
+    ([fact("PLANT_COUNT", 1)], 0),
+    ([fact("PLI_BENEFICIARY", text="auto"), fact("PLANT_COUNT", 3)], 20),   # best of, not a sum
+    ([fact("PLI_BENEFICIARY", text="auto", conf=0.6)], 0),                   # below the floor
+])
+def test_buying_bucket_takes_the_best_amr_fact(obs, points):
+    score, _ = company_fit(ACME, BASE, obs, config())
+    assert score == 75 + points
+
+
+def test_a_recent_expansion_counts_and_an_old_one_doesnt():
+    now = datetime.now(timezone.utc)
+    fresh = now.year * 100 + now.month
+    old = (now.year - 3) * 100 + now.month
+    assert company_fit(ACME, BASE, [fact("EXPANSION_NEWS", fresh, "new plant")], config())[0] == 100
+    assert company_fit(ACME, BASE, [fact("EXPANSION_NEWS", old, "new plant")], config())[0] == 75
+    assert not recent_expansion(202513) and not recent_expansion(None)
+
+
+def test_no_plant_or_warehouse_scores_zero_with_the_reason():
+    score, reasons = company_fit(ACME, BASE, [fact("NO_PHYSICAL_OPERATION", text="trader")], config())
+    assert score == 0 and "trader" in reasons[0]
+
+
+def test_a_cleared_or_low_confidence_disqualifier_doesnt_count():
+    cleared = [fact("NO_PHYSICAL_OPERATION", text="trader"),
+               fact("NO_PHYSICAL_OPERATION", 0, at="2026-11-02 10:00:00")]
+    assert company_fit(ACME, BASE, cleared, config())[0] == 75
+    assert company_fit(ACME, BASE, [fact("NO_PHYSICAL_OPERATION", text="x", conf=0.5)], config())[0] == 75
+
+
+def test_a_small_company_loses_points_but_never_goes_below_zero():
+    assert company_fit(ACME, BASE, [fact("EMPLOYEE_BAND", 40)], config())[0] == 60
+    nobody = {"id": "c2", "name": "Tiny", "industry": "other"}
+    assert company_fit(nobody, [], [fact("EMPLOYEE_BAND", 10)], config())[0] == 0
+
+
+@pytest.mark.parametrize("score,band", [(100, "A"), (70, "A"), (69, "B"), (45, "B"), (44, "C"), (0, "C")])
+def test_bands(score, band):
+    assert fit_band(score) == band

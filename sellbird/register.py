@@ -12,6 +12,7 @@ import csv
 import io
 
 from sellbird.config import ComplianceConfig, live_do_not_contact
+from sellbird.amr import AMR_CODES
 from sellbird.fit import company_fit, current_roles
 from sellbird.gate import do_not_contact_match
 
@@ -112,9 +113,10 @@ async def build_register(query_db, config, company_id: str | None = None) -> lis
         "SELECT p.company_id, o.status, o.send_at FROM outbox o JOIN prospects p ON p.id = o.prospect_id "
         "WHERE 1=1" + one.format(col="p.company_id"), args)
     observations = await query_db(
-        "SELECT company_id, signal_code, value_text, value_num, observed_at FROM observations "
-        "WHERE signal_code IN "
-        "('DECISION_MAKER_TITLE', 'CONTACT_FORM_URL', 'HIRING_ROLE')" + one.format(col="company_id"), args)
+        "SELECT company_id, signal_code, value_text, value_num, confidence, collector, "
+        "evidence_url, observed_at FROM observations WHERE signal_code IN "
+        "('DECISION_MAKER_TITLE', 'CONTACT_FORM_URL', 'HIRING_ROLE', "
+        + ", ".join(f"'{c}'" for c in AMR_CODES) + ")" + one.format(col="company_id"), args)
     by_p: dict[str, list] = {}
     by_o: dict[str, list] = {}
     by_obs: dict[str, list] = {}
