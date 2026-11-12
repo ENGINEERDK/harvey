@@ -429,3 +429,8 @@ async def test_export_filters_by_industry_and_status(state):
                                    industries=["electronics"])
     assert [r["first_name"] for r in rows] == ["P1"]
     assert rows[0]["fit_band"] in ("A", "B", "C")
+
+
+@pytest.mark.asyncio
+async def test_no_icp_means_no_fit_ordering_not_an_error(state):
+    assert await amr.fit_scores(state, SimpleNamespace()) == {}

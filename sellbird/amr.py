@@ -295,6 +295,8 @@ BRIEFS_PER_CYCLE = 10
 async def fit_scores(state, config) -> dict[str, int]:
     """{company_id: fit} for every company, read in one pass (sellbird.register)."""
     from sellbird.register import build_register, sqlite_query
+    if getattr(config, "icp", None) is None:
+        return {}           # nothing to score against: keep the Writer's own order
     rows = await build_register(sqlite_query(state.db_path), config)
     return {r["id"]: r["fit"] for r in rows}
 
